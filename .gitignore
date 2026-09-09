@@ -9,3 +9,5 @@ test-output*
 *.iml
 *.log
 *.tmp
+/cpa-plugin-privacyfilter
+

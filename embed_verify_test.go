@@ -1,33 +1,26 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 )
 
-// TestNewFilter_UsesEmbeddedRules simulates a store install: an empty plugin
-// directory with no rules/gitleaks.toml sidecar. newFilter must still load the
-// embedded rules (loaded rules > 0), proving the filter works without a sidecar.
-func TestNewFilter_UsesEmbeddedRules(t *testing.T) {
+// TestNewScanner_UsesEmbeddedRules simulates a store install: an empty plugin
+// directory with no rules/gitleaks.toml sidecar. newScanner must still load the
+// embedded rules, proving the plugin works without a sidecar file.
+func TestNewScanner_UsesEmbeddedRules(t *testing.T) {
 	emptyDir := t.TempDir()
 
-	f, err := newFilter(emptyDir, defaultConfig())
+	scanner, err := newScanner(emptyDir, defaultConfig())
 	if err != nil {
-		t.Fatalf("newFilter() with embedded rules error = %v", err)
+		t.Fatalf("newScanner() with embedded rules error = %v", err)
 	}
-	rules, _ := f.Stats()
-	if rules == 0 {
-		t.Fatal("expected embedded rules to be loaded, got 0 rules")
+	rules, _ := scanner.Stats()
+	if rules < 100 {
+		t.Fatalf("expected the embedded gitleaks set, got %d rules", rules)
 	}
-	t.Logf("loaded %d embedded rules without sidecar file", rules)
+	t.Logf("loaded %d embedded rules without a sidecar file", rules)
 
-	// Temp files written during materialization must be cleaned up.
-	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "privacyfilter-gitleaks-*.toml"))
-	if err != nil {
-		t.Fatalf("glob temp rules: %v", err)
-	}
-	if len(matches) != 0 {
-		t.Fatalf("temp rules file was not cleaned up: %v", matches)
+	if got := scanner.Redact("token " + sampleToken); !got.Hit {
+		t.Fatal("embedded rules did not detect a github token")
 	}
 }

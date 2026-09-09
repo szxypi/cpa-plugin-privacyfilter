@@ -1,10 +1,12 @@
 package main
 
 import (
+	"github.com/rheodev/cpa-plugin-privacyfilter/internal/scan"
+
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-var pluginVersion = "0.2.0"
+var pluginVersion = "0.3.0"
 
 func buildPlugin(configYAML []byte, pluginDir string) (pluginapi.Plugin, error) {
 	cfg, errParse := parseConfig(configYAML)
@@ -15,16 +17,17 @@ func buildPlugin(configYAML []byte, pluginDir string) (pluginapi.Plugin, error) 
 		pluginDir = inferPluginDir()
 	}
 
+	scanner, errScanner := newScanner(pluginDir, cfg)
+	if errScanner != nil {
+		return pluginapi.Plugin{}, errScanner
+	}
+
 	p := &privacyFilterPlugin{
 		cfg:       cfg,
 		pluginDir: pluginDir,
+		scanner:   scanner,
+		cache:     scan.NewCache(cfg.cacheEntries(), cfg.cacheBytes()),
 	}
-
-	f, errFilter := newFilter(pluginDir, cfg)
-	if errFilter != nil {
-		return pluginapi.Plugin{}, errFilter
-	}
-	p.filter = f
 
 	return pluginapi.Plugin{
 		Metadata: pluginapi.Metadata{
@@ -47,6 +50,41 @@ func buildPlugin(configYAML []byte, pluginDir string) (pluginapi.Plugin, error) 
 					Name:        "skip_formats",
 					Type:        pluginapi.ConfigFieldTypeArray,
 					Description: "Source format names to skip redaction for.",
+				},
+				{
+					Name:        "disable_rules",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "Gitleaks rule ids to drop. Dropping generic-api-key roughly halves scan time.",
+				},
+				{
+					Name:        "max_body_bytes",
+					Type:        pluginapi.ConfigFieldTypeInteger,
+					Description: "Skip request bodies larger than this many bytes. Default 4194304, negative means no limit.",
+				},
+				{
+					Name:        "scan_tool_input",
+					Type:        pluginapi.ConfigFieldTypeBoolean,
+					Description: "Scan tool-call arguments and tool results as well as message text. Default true.",
+				},
+				{
+					Name:        "cache_entries",
+					Type:        pluginapi.ConfigFieldTypeInteger,
+					Description: "Number of scanned texts remembered between requests. Default 4096, 0 disables the cache.",
+				},
+				{
+					Name:        "cache_bytes",
+					Type:        pluginapi.ConfigFieldTypeInteger,
+					Description: "Byte budget for cached redacted text. Default 67108864.",
+				},
+				{
+					Name:        "workers",
+					Type:        pluginapi.ConfigFieldTypeInteger,
+					Description: "Goroutines used to scan one request's fields, capped at NumCPU. Default 4.",
+				},
+				{
+					Name:        "log_stats",
+					Type:        pluginapi.ConfigFieldTypeBoolean,
+					Description: "Log a debug line for clean requests too. Redactions are always logged.",
 				},
 			},
 		},

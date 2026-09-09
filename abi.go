@@ -189,12 +189,10 @@ func handlePrivacyFilterABIMethod(ctx context.Context, method string, request []
 		resp, errCall := p.InterceptRequestBeforeAuth(ctx, req.RequestInterceptRequest)
 		return abiOKEnvelopeWithError(resp, errCall)
 	case pluginabi.MethodRequestInterceptAfter:
-		var req abiRequestInterceptRequest
-		if errDecode := json.Unmarshal(request, &req); errDecode != nil {
-			return nil, errDecode
-		}
-		resp, errCall := p.InterceptRequestAfterAuth(ctx, req.RequestInterceptRequest)
-		return abiOKEnvelopeWithError(resp, errCall)
+		// This plugin only filters before auth (see InterceptRequestBeforeAuth).
+		// Returning here skips decoding the request envelope, which for a
+		// multi-megabyte body is the whole cost of the call.
+		return abiOKEnvelope(pluginapi.RequestInterceptResponse{})
 	default:
 		return abiErrorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
