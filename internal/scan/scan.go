@@ -12,6 +12,7 @@
 package scan
 
 import (
+	"sort"
 	"strings"
 	"sync"
 )
@@ -130,11 +131,95 @@ func (s *Scanner) RuleIDs() []string {
 	return out
 }
 
-// Redact detects and masks secrets and PII. It is safe for concurrent use.
-func (s *Scanner) Redact(text string) Result {
+// Source identifies the detector family that produced a span.
+type Source uint8
+
+const (
+	// SourcePII covers the structured detectors: email, phone, ID card, IPv4
+	// and bank card.
+	SourcePII Source = iota + 1
+	// SourceRule is a gitleaks-style rule match.
+	SourceRule
+	// SourceContext is the "password: value" sentence detector.
+	SourceContext
+	// SourceEntropy is the high-entropy token fallback.
+	SourceEntropy
+)
+
+// Span is one raw detection. Start and End are byte offsets into the scanned
+// text; Label is the upstream placeholder label ("[密钥]", "[邮箱]", ...).
+type Span struct {
+	Start, End int
+	Label      string
+	Source     Source
+	// ValueStart and ValueEnd equal Start and End, except for a rule match
+	// without a secretGroup, where they cover the first capturing group:
+	// `token: abc123` -> `abc123`.
+	ValueStart, ValueEnd int
+	// MinEntropy is the rule's entropy threshold, 0 when it has none.
+	MinEntropy float64
+	// Rule is the gitleaks rule id for SourceRule spans.
+	Rule string
+}
+
+// Detect returns every raw detection in text, unmerged and in detector order.
+// Redact is exactly Merge(Detect(text)) applied to the text. It is safe for
+// concurrent use.
+func (s *Scanner) Detect(text string) []Span {
 	if text == "" {
-		return Result{Redacted: text}
+		return nil
 	}
+	var out []Span
+	s.detect(text, func(spans []span) {
+		if len(spans) == 0 {
+			return
+		}
+		out = make([]Span, len(spans))
+		for i, sp := range spans {
+			valueStart, valueEnd := sp.valueStart, sp.valueEnd
+			if valueStart == 0 && valueEnd == 0 {
+				valueStart, valueEnd = sp.start, sp.end
+			}
+			out[i] = Span{Start: sp.start, End: sp.end, Label: sp.label, Source: sp.source,
+				ValueStart: valueStart, ValueEnd: valueEnd, MinEntropy: sp.minEntropy, Rule: sp.rule}
+		}
+	})
+	return out
+}
+
+// Entropy is the Shannon entropy of s in bits per byte.
+func Entropy(s string) float64 { return shannonEntropy(s) }
+
+// Merge drops invalid and overlapping spans with the same policy Redact uses:
+// sorted by start ascending, longest first on ties, then greedily kept if
+// disjoint. The input slice is reordered in place.
+func Merge(spans []Span) []Span {
+	valid := spans[:0]
+	for _, s := range spans {
+		if s.Start >= 0 && s.Start < s.End {
+			valid = append(valid, s)
+		}
+	}
+	sort.SliceStable(valid, func(i, j int) bool {
+		if valid[i].Start != valid[j].Start {
+			return valid[i].Start < valid[j].Start
+		}
+		return valid[i].End > valid[j].End
+	})
+	merged := valid[:0]
+	lastEnd := -1
+	for _, s := range valid {
+		if s.Start >= lastEnd {
+			merged = append(merged, s)
+			lastEnd = s.End
+		}
+	}
+	return merged
+}
+
+// detect runs every detector over text and hands the raw spans to use. The
+// slice is scratch storage and is only valid inside use.
+func (s *Scanner) detect(text string, use func([]span)) {
 	work := s.scratch.Get().(*scratch)
 	defer func() {
 		work.spans = work.spans[:0]
@@ -154,8 +239,18 @@ func (s *Scanner) Redact(text string) Result {
 	spans = detectPII(text, &sig, spans)
 	spans = s.detectSecrets(text, &sig, patHit, spans)
 	work.spans = spans
+	use(spans)
+}
 
-	merged := mergeSpans(spans)
+// Redact detects and masks secrets and PII. It is safe for concurrent use.
+func (s *Scanner) Redact(text string) Result {
+	if text == "" {
+		return Result{Redacted: text}
+	}
+	var merged []span
+	s.detect(text, func(spans []span) {
+		merged = append(merged, mergeSpans(spans)...)
+	})
 	if len(merged) == 0 {
 		return Result{Redacted: text}
 	}
@@ -222,7 +317,7 @@ func (s *Scanner) prescan(text string, patHit []bool, tokenRuns []span) signals 
 			tokenRun++
 		} else {
 			if tokenRun >= 20 {
-				sig.tokenRuns = append(sig.tokenRuns, span{i - tokenRun, i, ""})
+				sig.tokenRuns = append(sig.tokenRuns, span{start: i - tokenRun, end: i})
 			}
 			tokenRun = 0
 		}
@@ -239,7 +334,7 @@ func (s *Scanner) prescan(text string, patHit []bool, tokenRuns []span) signals 
 		}
 	}
 	if tokenRun >= 20 {
-		sig.tokenRuns = append(sig.tokenRuns, span{len(text) - tokenRun, len(text), ""})
+		sig.tokenRuns = append(sig.tokenRuns, span{start: len(text) - tokenRun, end: len(text)})
 	}
 
 	if sig.hasAssign {
@@ -290,7 +385,17 @@ func (s *Scanner) detectSecrets(text string, sig *signals, patHit []bool, spans 
 				isLikelyPlaceholder(candidate) || hasJSONNoise(candidate) {
 				continue
 			}
-			spans = append(spans, span{start, end, "[密钥]"})
+			valueStart, valueEnd := start, end
+			if rule.SecretGroup == 0 {
+				for g := 1; 2*g+1 < len(m); g++ {
+					if m[2*g] >= 0 && m[2*g] < m[2*g+1] {
+						valueStart, valueEnd = m[2*g], m[2*g+1]
+						break
+					}
+				}
+			}
+			spans = append(spans, span{start: start, end: end, label: "[密钥]", source: SourceRule,
+				valueStart: valueStart, valueEnd: valueEnd, minEntropy: rule.Entropy, rule: rule.ID})
 		}
 	}
 
@@ -304,7 +409,7 @@ func (s *Scanner) detectSecrets(text string, sig *signals, patHit []bool, spans 
 				if len(value) <= 16 && shannonEntropy(value) < 3.0 {
 					continue
 				}
-				spans = append(spans, span{m[4], m[5], "[密钥]"})
+				spans = append(spans, span{start: m[4], end: m[5], label: "[密钥]", source: SourceContext})
 			}
 		}
 	}
@@ -327,7 +432,7 @@ func (s *Scanner) detectSecrets(text string, sig *signals, patHit []bool, spans 
 			threshold = entropyMinStrict
 		}
 		if shannonEntropy(candidate) >= threshold {
-			spans = append(spans, span{start, end, "[密钥]"})
+			spans = append(spans, span{start: start, end: end, label: "[密钥]", source: SourceEntropy})
 		}
 	}
 	return spans

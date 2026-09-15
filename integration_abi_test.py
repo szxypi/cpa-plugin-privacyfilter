@@ -5,6 +5,7 @@ import base64
 import ctypes
 import json
 import pathlib
+import re
 import sys
 import tempfile
 
@@ -112,12 +113,12 @@ GEMINI_BODY = json.dumps(
 ).encode()
 
 
-def intercept(plugin: PluginAPI, method: str, body: bytes, model: str = "claude-sonnet-5") -> bytes | None:
+def intercept(plugin: PluginAPI, method: str, body: bytes, model: str = "claude-sonnet-5", request_id: str = "req-1") -> bytes | None:
     result = invoke(
         plugin,
         method,
         {
-            "RequestID": "req-1",
+            "RequestID": request_id,
             "TraceID": "trace-1",
             "SourceFormat": "claude",
             "ToFormat": "claude",
@@ -134,6 +135,45 @@ def intercept(plugin: PluginAPI, method: str, body: bytes, model: str = "claude-
     if not encoded:
         return None
     return base64.b64decode(encoded)
+
+
+def respond(plugin: PluginAPI, body: bytes, request_id: str = "req-1") -> bytes | None:
+    result = invoke(
+        plugin,
+        "response.intercept_after",
+        {
+            "RequestID": request_id,
+            "SourceFormat": "claude",
+            "Model": "claude-sonnet-5",
+            "RequestedModel": "claude-sonnet-5",
+            "Stream": False,
+            "RequestHeaders": {},
+            "ResponseHeaders": {},
+            "Body": base64.b64encode(body).decode(),
+            "StatusCode": 200,
+            "Metadata": {},
+        },
+    )
+    encoded = result.get("Body")
+    return base64.b64decode(encoded) if encoded else None
+
+
+def stream_chunk(plugin: PluginAPI, index: int, body: bytes, request_id: str = "req-1") -> dict:
+    return invoke(
+        plugin,
+        "response.intercept_stream_chunk",
+        {
+            "RequestID": request_id,
+            "SourceFormat": "claude",
+            "Model": "claude-sonnet-5",
+            "RequestedModel": "claude-sonnet-5",
+            "RequestHeaders": {},
+            "ResponseHeaders": {},
+            "Body": base64.b64encode(body).decode() if body else None,
+            "ChunkIndex": index,
+            "Metadata": {},
+        },
+    )
 
 
 def main() -> None:
@@ -157,6 +197,7 @@ def main() -> None:
         "log_stats: true\n"
         "cache_entries: 64\n"
         "workers: 2\n"
+        f"data_dir: {plugin_dir}/data\n"
     ).encode()
 
     try:
@@ -169,7 +210,8 @@ def main() -> None:
             },
         )
         capabilities = registration["capabilities"]
-        if not capabilities.get("request_interceptor"):
+        wanted = ("request_interceptor", "response_interceptor", "response_stream_interceptor", "request_lifecycle_plugin")
+        if not all(capabilities.get(name) for name in wanted):
             raise AssertionError(f"unexpected capabilities: {capabilities}")
         metadata = registration["metadata"]
         for field in ("Name", "Version", "Author", "GitHubRepository"):
@@ -181,7 +223,9 @@ def main() -> None:
         expected = {
             "gitleaks_toml", "skip_models", "skip_formats", "disable_rules",
             "max_body_bytes", "scan_tool_input", "cache_entries", "cache_bytes",
-            "workers", "log_stats",
+            "workers", "log_stats", "placeholder_style", "placeholder_prefix",
+            "restore_responses", "notice", "skip_types", "data_dir",
+            "vault_max_entries", "literal_min_bytes",
         }
         if advertised != expected:
             raise AssertionError(f"config fields drifted: {sorted(advertised)}")
@@ -194,8 +238,15 @@ def main() -> None:
         text = redacted.decode()
         if SECRET_TOKEN in text or SECRET_EMAIL in text:
             raise AssertionError(f"secret survived redaction: {text}")
-        if "[密钥]" not in text or "[邮箱]" not in text:
+        token_ph = re.search(r"GITHUB_TOKEN=(pf-key-[0-9a-f]{12})", text)
+        email_ph = re.search(r"OWNER=(pf-email-[0-9a-f]{12})", text)
+        if not token_ph or not email_ph:
             raise AssertionError(f"placeholders missing: {text}")
+        token_ph, email_ph = token_ph.group(1), email_ph.group(1)
+        if "[privacyfilter]" not in json.loads(redacted)["system"][-1]["text"]:
+            raise AssertionError("notice was not appended to the system prompt")
+        if (pathlib.Path(plugin_dir) / "data" / "placeholder.key").stat().st_mode & 0o077:
+            raise AssertionError("placeholder key must not be group/world readable")
         if '"tool_use_id":"toolu_01ABCDEF"' not in text:
             raise AssertionError("tool_use_id was not preserved")
         if '"model":"claude-sonnet-5","max_tokens":4096' not in text:
@@ -208,6 +259,39 @@ def main() -> None:
         # of an already filtered body.
         if intercept(plugin, "request.intercept_after", CLAUDE_BODY) is not None:
             raise AssertionError("after-auth hook must not rewrite the body")
+
+        # Non-streaming response: placeholders come back as the real values.
+        reply = json.dumps(
+            {"content": [{"type": "text", "text": f"owner {email_ph}"},
+                         {"type": "tool_use", "id": "t", "name": "Bash", "input": {"command": f"echo {token_ph}"}}]},
+            separators=(",", ":"),
+        ).encode()
+        restored = respond(plugin, reply)
+        if restored is None:
+            raise AssertionError("response hook did not restore")
+        restored_json = json.loads(restored)
+        if restored_json["content"][0]["text"] != f"owner {SECRET_EMAIL}" or \
+                restored_json["content"][1]["input"]["command"] != f"echo {SECRET_TOKEN}":
+            raise AssertionError(f"unexpected restore: {restored}")
+
+        # Streaming: a placeholder split across two deltas is reassembled.
+        intercept(plugin, "request.intercept_before", CLAUDE_BODY, request_id="req-2")
+        stream_chunk(plugin, -1, b"", request_id="req-2")
+        pieces = [token_ph[:9], token_ph[9:] + " done"]
+        emitted = ""
+        for index, piece in enumerate(pieces):
+            event = ("event: content_block_delta\ndata: " + json.dumps(
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": piece}},
+                separators=(",", ":")) + "\n\n").encode()
+            result = stream_chunk(plugin, index, event, request_id="req-2")
+            if result.get("DropChunk"):
+                raise AssertionError("claude chunks must never be dropped")
+            out = base64.b64decode(result["Body"]) if result.get("Body") else event
+            payload = out.decode().split("data: ", 1)[1].split("\n", 1)[0]
+            emitted += json.loads(payload)["delta"]["text"]
+        if emitted != f"{SECRET_TOKEN} done":
+            raise AssertionError(f"stream restore produced {emitted!r}")
+        invoke(plugin, "request.complete", {"RequestID": "req-2", "Outcome": "succeeded", "StatusCode": 200})
 
         # A clean body must pass through untouched (nil body on the wire).
         clean = json.dumps(
@@ -227,6 +311,7 @@ def main() -> None:
             "enabled: true\n"
             "skip_models:\n"
             "  - claude-sonnet-5\n"
+            f"data_dir: {plugin_dir}/data\n"
         ).encode()
         invoke(
             plugin,

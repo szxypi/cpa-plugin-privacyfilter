@@ -2,8 +2,10 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A native privacy filter plugin for CLIProxyAPI. It intercepts model requests, detects sensitive text, and redacts it
-before the request is forwarded to an upstream provider.
+A native privacy filter plugin for CLIProxyAPI. Before a request is forwarded upstream it replaces keys, tokens,
+passwords, emails, IP addresses and other sensitive values with placeholders, and it swaps the placeholders back to the
+real values in the response. The values stay in the local CPA process; the model can still put them into commands,
+code and configuration.
 
 AI learners and builders can join the Linux.do community: [linux.do](https://linux.do/).
 
@@ -13,7 +15,9 @@ adapts it to the CPA plugin ABI from [router-for-me/CLIProxyAPI](https://github.
 ## What It Does
 
 When CLIProxyAPI receives a request, this plugin scans supported text fields before the request leaves the local
-process. If sensitive content is found, the request body is rewritten with redacted placeholders.
+process and replaces every detected value with a deterministic placeholder such as `pf-key-3a7f9c21d0b4`. When the
+model's reply (streamed text and tool-call arguments included) passes back through the plugin, placeholders are
+restored to the real values.
 
 Typical use cases:
 
@@ -22,7 +26,38 @@ Typical use cases:
 - Apply Gitleaks-style secret detection to LLM traffic
 - Keep filtering local to the CLIProxyAPI plugin pipeline
 
-## Changes in This Fork
+## v0.4.0: reversible replacement
+
+Up to v0.3.0 values were replaced by fixed labels (`[密钥]`, `[邮箱]`). The model never had the value and wrote the
+label into commands and config files, so coding-agent workflows kept failing. v0.4.0 makes the replacement reversible:
+
+| Stage | Behaviour |
+| --- | --- |
+| Placeholder | `<prefix>-<type>-<12 hex>`, an HMAC of the value under a local key: the same value always renders the same placeholder, so replayed history keeps prompt caches warm. Types: `key`, `email`, `phone`, `idcard`, `ip`, `card`. A `uuid` style is available. |
+| Mapping | Held in CPA process memory only (the vault), never written to disk. The only file is `data_dir/placeholder.key` (0600), which keeps placeholders stable across restarts. |
+| Request | Detections are narrowed to the value itself (`GITHUB_TOKEN=ghp_...` replaces only `ghp_...`, the key name stays visible). A value that was detected once is replaced in any string of later bodies, including fields the detectors do not read and tool arguments with `scan_tool_input: false`; keys of 8+ bytes match without word boundaries, so `-p<password>` is covered. |
+| Response | Non-streaming bodies are restored as JSON. Streams are handled per protocol, including the Responses WebSocket downstream Codex uses; a placeholder split across deltas is held back and flushed before the block ends. Values inside tool-call arguments (JSON text) are JSON-escaped. Only placeholders present in the request's upstream body are restored, so a provider cannot pull another conversation's value in by emitting its placeholder. |
+| Not restored | `thinking`, `redacted_thinking`, `reasoning` and signatures are replayed verbatim by clients and signed by providers, so they keep their placeholders. |
+| Notice | When a request carries placeholders and restoration is on, a short matter-of-fact note is appended to the system prompt telling the model to use references verbatim. Framing them as protected secrets made models refuse to use them. |
+
+Why not UUIDs by default: a UUID costs about 24 tokens and models copy them noticeably less reliably than short ids
+([boundaryml](https://boundaryml.com/blog/uuid-swap)); LLM Guard, llmasking-go and Kong's AI Sanitizer all use a type plus
+a short id. The fixed prefix also lets the response side skip text without a placeholder at no cost.
+
+Verified end to end: Claude Messages, OpenAI chat, OpenAI Responses and Gemini clients, against Claude and OpenAI
+upstreams, streaming and not; the upstream never saw a clear value and clients got real values in text and tool
+arguments. Real models (MiniMax-M3, DeepSeek) completed config-writing tasks through placeholders.
+
+Known limits:
+
+- The vault lives in memory and is empty after a CPA restart. Values are re-learned from the history of the next
+  request, but a value whose recognisable context is gone (compacted away) may not be caught in a new context.
+- The vault is not partitioned per client: a client that presents a known placeholder is treated as its owner. Do
+  not rely on it for isolation between mutually untrusted users of one CPA.
+- CPA 7.3.3's gemini->claude translator drops `systemInstruction`, so that combination gets no notice (replacement
+  and restoration still work).
+
+## Changes in This Fork (v0.3.0)
 
 This fork (v0.3.0) is tuned for coding-agent traffic: Claude Code, Codex, opencode and antigravity send bodies of tens
 of KB to several MB and replay the entire conversation on every turn. [CHANGELOG.md](CHANGELOG.md) has the full list
@@ -89,8 +124,8 @@ its checksum:
 
 ```bash
 make dist
-# dist/privacyfilter-v0.3.0.so
-# dist/privacyfilter-v0.3.0.so.sha256
+# dist/privacyfilter-v0.4.0.so
+# dist/privacyfilter-v0.4.0.so.sha256
 ```
 
 Build for a specific platform:
@@ -122,8 +157,8 @@ Then enable the `privacyfilter` plugin in CLIProxyAPI.
 Plugin metadata:
 
 - Name: `privacyfilter`
-- Capability: `RequestInterceptor` (before-auth hook only)
-- Author: `rheodev`
+- Capabilities: `RequestInterceptor` (before-auth hook only), `ResponseInterceptor`, `StreamChunkInterceptor`, `RequestLifecyclePlugin`
+- Author: `rheodev, szxypi`
 
 ### Local install (systemd deployment)
 
@@ -132,7 +167,7 @@ versions of the library, restarts the service and waits for the registration lin
 
 ```bash
 make dist
-sudo ops/deploy            # or: sudo ops/deploy 0.3.0
+sudo ops/deploy            # or: sudo ops/deploy 0.4.0
 ```
 
 It expects the layout used by a native systemd install:
@@ -141,7 +176,7 @@ It expects the layout used by a native systemd install:
 - config `/var/lib/cli-proxy-api/config.yaml`
 - unit `cli-proxy-api.service`
 
-CPA derives the plugin id from the file name (`privacyfilter-v0.3.0.so` -> `privacyfilter`) and ignores any library
+CPA derives the plugin id from the file name (`privacyfilter-v0.4.0.so` -> `privacyfilter`) and ignores any library
 with no matching `plugins.configs` entry, so the config entry must exist before the restart. `ops/deploy` refuses to
 run without one. Edit `config.yaml` in place; replacing it by rename detaches CPA's config watcher from the file.
 
@@ -282,7 +317,7 @@ Common commands:
 make test                                   # go vet ./... && go test ./...
 make bench                                  # every benchmark, 10 iterations
 make dist                                   # dist/privacyfilter-v<version>.so + .sha256
-python3 integration_abi_test.py dist/privacyfilter-v0.3.0.so
+python3 integration_abi_test.py dist/privacyfilter-v0.4.0.so
 ```
 
 `integration_abi_test.py` loads the compiled library through the real C ABI (`cliproxy_plugin_init`, `plugin.register`,

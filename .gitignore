@@ -10,4 +10,4 @@ test-output*
 *.log
 *.tmp
 /cpa-plugin-privacyfilter
-
+/privacyfilter/

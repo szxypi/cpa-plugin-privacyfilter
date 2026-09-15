@@ -142,13 +142,19 @@ func (c *collector) block(block gjson.Result, depth int) {
 	switch block.Get("type").String() {
 	case "text", "input_text", "output_text", "summary_text":
 		c.add(block.Get("text"))
-	case "tool_result", "function_call_output":
+	case "tool_result", "function_call_output", "custom_tool_call_output", "local_shell_call_output", "mcp_call_output":
 		c.content(block.Get("content"), depth)
-		c.add(block.Get("output"))
-	case "tool_use", "function_call", "server_tool_use", "mcp_tool_use":
+		c.content(block.Get("output"), depth)
+	case "tool_use", "function_call", "server_tool_use", "mcp_tool_use", "custom_tool_call", "local_shell_call", "mcp_call":
 		if c.opts.ScanToolInput {
-			c.free(block.Get("input"), depth)
+			if input := block.Get("input"); input.Type == gjson.String {
+				c.add(input) // Responses custom tools (apply_patch) take free text
+			} else {
+				c.free(input, depth)
+			}
 			c.add(block.Get("arguments"))
+			c.free(block.Get("action"), depth)
+			c.add(block.Get("output"))
 		}
 	case "thinking", "redacted_thinking", "reasoning":
 		// Extended-thinking blocks are replayed verbatim: they carry a
@@ -240,6 +246,54 @@ func isBinaryKey(key string) bool {
 	return false
 }
 
+// remainingStrings returns every other string literal in the body that a
+// restored value could have been written into: fields outside the collector's
+// shapes, keys the collector skips, tool arguments when scan_tool_input is off.
+// They get no detection, only the known-value pass, so a value restored into a
+// response never goes back upstream in clear text. Signed thinking and
+// reasoning content is skipped for the same reason the restore side skips it.
+func remainingStrings(body []byte, seen map[int]struct{}, minBytes int) []textRef {
+	var out []textRef
+	var walk func(v gjson.Result, depth int)
+	walk = func(v gjson.Result, depth int) {
+		if depth > 64 {
+			return
+		}
+		switch {
+		case v.Type == gjson.String:
+			if v.Index <= 0 || len(v.Raw) < minBytes+2 {
+				return
+			}
+			if _, ok := seen[v.Index]; ok {
+				return
+			}
+			text := v.String()
+			if len(text) >= minBytes && !looksBinary(text) {
+				out = append(out, textRef{index: v.Index, raw: v.Raw, value: text})
+			}
+		case v.IsObject():
+			if restoreSkipTypes[v.Get("type").String()] {
+				return
+			}
+			v.ForEach(func(k, item gjson.Result) bool {
+				if !restoreSkipKeys[k.String()] {
+					walk(item, depth+1)
+				}
+				return true
+			})
+		case v.IsArray():
+			v.ForEach(func(_, item gjson.Result) bool {
+				walk(item, depth+1)
+				return true
+			})
+		}
+	}
+	if gjson.ValidBytes(body) {
+		walk(gjson.ParseBytes(body), 0)
+	}
+	return out
+}
+
 // add records a string field, skipping empties, duplicates and blobs.
 func (c *collector) add(value gjson.Result) {
 	if value.Type != gjson.String || value.Index <= 0 || len(value.Raw) < 2 {
@@ -310,10 +364,17 @@ const hexDigits = "0123456789abcdef"
 
 // appendJSONString writes s as a JSON string literal. It matches
 // encoding/json with SetEscapeHTML(false): only the characters JSON requires
-// are escaped, so redacted text stays as close to the original bytes as
+// are escaped, so rewritten text stays as close to the original bytes as
 // possible.
 func appendJSONString(dst []byte, s string) []byte {
 	dst = append(dst, '"')
+	dst = appendJSONStringBody(dst, s)
+	return append(dst, '"')
+}
+
+// appendJSONStringBody writes the escaped body of a JSON string literal,
+// without the surrounding quotes.
+func appendJSONStringBody(dst []byte, s string) []byte {
 	start := 0
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -341,6 +402,5 @@ func appendJSONString(dst []byte, s string) []byte {
 		}
 		start = i + 1
 	}
-	dst = append(dst, s[start:]...)
-	return append(dst, '"')
+	return append(dst, s[start:]...)
 }

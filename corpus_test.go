@@ -130,7 +130,7 @@ func TestCoverageAgainstLegacy(t *testing.T) {
 	_, legacyScanned := legacy.redactRequestBody(body)
 
 	p := newTestPlugin(t)
-	out, stats := p.redactRequestBody(body)
+	out, stats, _ := p.redactRequestBody(body)
 
 	t.Logf("body=%d bytes, legacy scanned=%d bytes, current scanned=%d bytes in %d fields",
 		len(body), legacyScanned, stats.scanned, stats.fields)

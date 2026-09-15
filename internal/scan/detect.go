@@ -24,6 +24,13 @@ const (
 type span struct {
 	start, end int
 	label      string
+	source     Source
+	// valueStart/valueEnd narrow a rule match without a secretGroup to its
+	// first capturing group; Redact ignores them (upstream semantics), the
+	// plugin uses them to keep key names out of placeholders.
+	valueStart, valueEnd int
+	minEntropy           float64
+	rule                 string
 }
 
 var (
@@ -167,34 +174,34 @@ func detectPII(text string, sig *signals, spans []span) []span {
 			if isInSSHCommandContext(text, m[0]) {
 				continue
 			}
-			spans = append(spans, span{m[0], m[1], "[邮箱]"})
+			spans = append(spans, span{start: m[0], end: m[1], label: "[邮箱]", source: SourcePII})
 		}
 	}
 	if sig.maxDigitRun >= 11 {
 		for _, m := range rePhoneCN.FindAllStringIndex(text, -1) {
 			if digitBounded(text, m[0], m[1]) {
-				spans = append(spans, span{m[0], m[1], "[电话]"})
+				spans = append(spans, span{start: m[0], end: m[1], label: "[电话]", source: SourcePII})
 			}
 		}
 	}
 	if sig.maxDigitRun >= 17 {
 		for _, m := range reIDCard.FindAllStringIndex(text, -1) {
 			if digitBounded(text, m[0], m[1]) {
-				spans = append(spans, span{m[0], m[1], "[身份证]"})
+				spans = append(spans, span{start: m[0], end: m[1], label: "[身份证]", source: SourcePII})
 			}
 		}
 	}
 	if sig.hasIPv4 {
 		for _, m := range reIPv4.FindAllStringIndex(text, -1) {
 			if ipBounded(text, m[0], m[1]) {
-				spans = append(spans, span{m[0], m[1], "[IP]"})
+				spans = append(spans, span{start: m[0], end: m[1], label: "[IP]", source: SourcePII})
 			}
 		}
 	}
 	if sig.maxDigitRun >= 13 {
 		for _, m := range reBankCard.FindAllStringIndex(text, -1) {
 			if digitBounded(text, m[0], m[1]) && luhnValid(text[m[0]:m[1]]) {
-				spans = append(spans, span{m[0], m[1], "[银行卡]"})
+				spans = append(spans, span{start: m[0], end: m[1], label: "[银行卡]", source: SourcePII})
 			}
 		}
 	}

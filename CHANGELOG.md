@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.4.0
+
+Reversible replacement. Sensitive values are replaced by placeholders on the way upstream and restored on the way
+back, so coding agents can keep using keys, passwords and addresses without the provider ever seeing them.
+
+### Changed
+
+- Placeholders are `pf-<type>-<12 hex>` (or a v8 UUID with `placeholder_style: uuid`), derived by HMAC-SHA256 from the
+  value under a key stored in `data_dir/placeholder.key`. Same value, same placeholder, across requests and restarts.
+- The placeholder -> value table (vault) is process memory only, bounded by `vault_max_entries`.
+- Detections are narrowed to the value: rule matches without a `secretGroup` use their first capture group (with the
+  rule's entropy re-checked on it), and `NAME=value` token runs drop the name. Context-sentence matches that look like
+  code (`os.getenv(`, `config.auth.token`, `null`) and loopback / netmask IPs are no longer replaced.
+- Known values are replaced again wherever they appear on a word boundary (`literal_min_bytes`), so a value restored
+  into a command does not go upstream in clear text on the next turn.
+- The detection cache stores offsets instead of redacted text.
+- New config: `placeholder_style`, `placeholder_prefix`, `restore_responses`, `notice`, `skip_types`, `data_dir`,
+  `vault_max_entries`, `literal_min_bytes`. Config field descriptions are in Chinese.
+
+### Added
+
+- `ResponseInterceptor`: restores non-streaming responses, skipping thinking / reasoning content and signatures.
+- `StreamChunkInterceptor`: per-protocol delta restoration for Claude, OpenAI chat, OpenAI Responses and Gemini
+  streams, with hold-back of placeholder prefixes split across deltas and JSON escaping inside tool arguments.
+  Requests without placeholders are answered in the ABI layer without decoding the chunk.
+- `RequestLifecyclePlugin`: drops per-request state when the request completes.
+- A system-prompt notice (`notice`) when a request carries placeholders.
+- `roundtrip_test.go` covers determinism, the literal pass, byte-stable history replay, every stream protocol and
+  notice injection; `integration_abi_test.py` exercises the new ABI methods.
+
 ## 0.3.0
 
 This release is a fork-local rework aimed at coding-agent traffic (Claude Code,

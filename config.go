@@ -17,10 +17,14 @@ const privacyFilterProvider = "privacyfilter"
 const pluginName = "privacyfilter"
 
 const (
-	defaultMaxBodyBytes = int64(4 << 20) // 4 MiB
-	defaultCacheEntries = 4096
-	defaultCacheBytes   = int64(64 << 20) // 64 MiB of redacted output
-	defaultMaxWorkers   = 4
+	defaultMaxBodyBytes      = int64(4 << 20) // 4 MiB
+	defaultCacheEntries      = 4096
+	defaultCacheBytes        = int64(64 << 20) // 64 MiB of cached analyses
+	defaultMaxWorkers        = 4
+	defaultPlaceholderPrefix = "pf"
+	defaultDataDir           = "privacyfilter"
+	defaultVaultMaxEntries   = 100000
+	defaultLiteralMinBytes   = 6
 )
 
 type privacyFilterConfig struct {
@@ -42,6 +46,27 @@ type privacyFilterConfig struct {
 	Workers *int `yaml:"workers"`
 	// LogStats emits a debug line for clean requests too.
 	LogStats bool `yaml:"log_stats"`
+
+	// PlaceholderStyle is "short" (pf-key-3a7f9c21d0b4) or "uuid".
+	PlaceholderStyle string `yaml:"placeholder_style"`
+	// PlaceholderPrefix is the leading word of short placeholders.
+	PlaceholderPrefix string `yaml:"placeholder_prefix"`
+	// RestoreResponses swaps placeholders in responses back to the real
+	// values. Turning it off makes the replacement one-way.
+	RestoreResponses *bool `yaml:"restore_responses"`
+	// Notice tells the model, in the system prompt, how to treat placeholders.
+	Notice *bool `yaml:"notice"`
+	// SkipTypes leaves these placeholder types (key, email, phone, idcard, ip,
+	// card) in clear text.
+	SkipTypes []string `yaml:"skip_types"`
+	// DataDir holds the placeholder HMAC key. Relative paths resolve against
+	// the CPA working directory.
+	DataDir string `yaml:"data_dir"`
+	// VaultMaxEntries bounds the in-memory value table.
+	VaultMaxEntries *int `yaml:"vault_max_entries"`
+	// LiteralMinBytes is the shortest known value re-replaced wherever it
+	// reappears, even where no detector would flag it.
+	LiteralMinBytes *int `yaml:"literal_min_bytes"`
 }
 
 func defaultConfig() privacyFilterConfig {
@@ -90,6 +115,57 @@ func (cfg *privacyFilterConfig) cacheBytes() int64 {
 		return defaultCacheBytes
 	}
 	return *cfg.CacheBytes
+}
+
+func (cfg *privacyFilterConfig) restoreResponses() bool {
+	return cfg.RestoreResponses == nil || *cfg.RestoreResponses
+}
+
+func (cfg *privacyFilterConfig) notice() bool {
+	return cfg.Notice == nil || *cfg.Notice
+}
+
+func (cfg *privacyFilterConfig) dataDir() string {
+	if strings.TrimSpace(cfg.DataDir) == "" {
+		return defaultDataDir
+	}
+	return cfg.DataDir
+}
+
+func (cfg *privacyFilterConfig) vaultMaxEntries() int {
+	if cfg.VaultMaxEntries == nil || *cfg.VaultMaxEntries <= 0 {
+		return defaultVaultMaxEntries
+	}
+	return *cfg.VaultMaxEntries
+}
+
+func (cfg *privacyFilterConfig) literalMinBytes() int {
+	if cfg.LiteralMinBytes == nil {
+		return defaultLiteralMinBytes
+	}
+	return max(*cfg.LiteralMinBytes, 4)
+}
+
+func (cfg *privacyFilterConfig) skipTypes() (map[string]bool, error) {
+	if len(cfg.SkipTypes) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]bool, len(cfg.SkipTypes))
+	for _, raw := range cfg.SkipTypes {
+		typ := strings.ToLower(strings.TrimSpace(raw))
+		if typ == "" {
+			continue
+		}
+		known := false
+		for _, t := range knownTypes {
+			known = known || t == typ
+		}
+		if !known {
+			return nil, fmt.Errorf("skip_types: unknown type %q (want one of %v)", raw, knownTypes)
+		}
+		out[typ] = true
+	}
+	return out, nil
 }
 
 func (cfg *privacyFilterConfig) workers() int {

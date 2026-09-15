@@ -54,6 +54,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/tidwall/gjson"
 )
 
 var privacyFilterABIState = struct {
@@ -87,6 +88,21 @@ type abiRequestInterceptRequest struct {
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
+type abiResponseInterceptRequest struct {
+	pluginapi.ResponseInterceptRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type abiStreamChunkInterceptRequest struct {
+	pluginapi.StreamChunkInterceptRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type abiRequestCompletion struct {
+	pluginapi.RequestCompletion
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
 type abiRegistration struct {
 	SchemaVersion uint32             `json:"schema_version"`
 	Metadata      pluginapi.Metadata `json:"metadata"`
@@ -94,7 +110,10 @@ type abiRegistration struct {
 }
 
 type abiCapabilities struct {
-	RequestInterceptor bool `json:"request_interceptor"`
+	RequestInterceptor     bool `json:"request_interceptor"`
+	ResponseInterceptor    bool `json:"response_interceptor"`
+	StreamChunkInterceptor bool `json:"response_stream_interceptor"`
+	RequestLifecyclePlugin bool `json:"request_lifecycle_plugin"`
 }
 
 func main() {}
@@ -193,6 +212,34 @@ func handlePrivacyFilterABIMethod(ctx context.Context, method string, request []
 		// Returning here skips decoding the request envelope, which for a
 		// multi-megabyte body is the whole cost of the call.
 		return abiOKEnvelope(pluginapi.RequestInterceptResponse{})
+	case pluginabi.MethodResponseInterceptStreamChunk:
+		// Every chunk of every stream comes through here. Requests with
+		// nothing to restore answer before the envelope is decoded.
+		if gjson.GetBytes(request, "ChunkIndex").Int() >= 0 {
+			st := p.states.get(gjson.GetBytes(request, "RequestID").String())
+			if st == nil || st.r == nil {
+				return emptyStreamChunkEnvelope, nil
+			}
+		}
+		var req abiStreamChunkInterceptRequest
+		if errDecode := json.Unmarshal(request, &req); errDecode != nil {
+			return nil, errDecode
+		}
+		resp, errCall := p.InterceptStreamChunk(ctx, req.StreamChunkInterceptRequest)
+		return abiOKEnvelopeWithError(resp, errCall)
+	case pluginabi.MethodResponseInterceptAfter:
+		var req abiResponseInterceptRequest
+		if errDecode := json.Unmarshal(request, &req); errDecode != nil {
+			return nil, errDecode
+		}
+		resp, errCall := p.InterceptResponse(ctx, req.ResponseInterceptRequest)
+		return abiOKEnvelopeWithError(resp, errCall)
+	case pluginabi.MethodRequestComplete:
+		var req abiRequestCompletion
+		if errDecode := json.Unmarshal(request, &req); errDecode != nil {
+			return nil, errDecode
+		}
+		return abiOKEnvelopeWithError(struct{}{}, p.HandleRequestComplete(ctx, req.RequestCompletion))
 	default:
 		return abiErrorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -219,7 +266,10 @@ func handlePrivacyFilterRegister(request []byte) ([]byte, error) {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata:      plugin.Metadata,
 		Capabilities: abiCapabilities{
-			RequestInterceptor: plugin.Capabilities.RequestInterceptor != nil,
+			RequestInterceptor:     plugin.Capabilities.RequestInterceptor != nil,
+			ResponseInterceptor:    plugin.Capabilities.ResponseInterceptor != nil,
+			StreamChunkInterceptor: plugin.Capabilities.StreamChunkInterceptor != nil,
+			RequestLifecyclePlugin: plugin.Capabilities.RequestLifecyclePlugin != nil,
 		},
 	})
 }
@@ -236,6 +286,8 @@ func beginPrivacyFilterPluginCall() (*privacyFilterPlugin, func(), error) {
 	privacyFilterABIState.inFlight.Add(1)
 	return privacyFilterABIState.plugin, privacyFilterABIState.inFlight.Done, nil
 }
+
+var emptyStreamChunkEnvelope, _ = abiOKEnvelope(pluginapi.StreamChunkInterceptResponse{})
 
 func abiOKEnvelopeWithError(v any, err error) ([]byte, error) {
 	if err != nil {

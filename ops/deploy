@@ -43,6 +43,9 @@ plugins:
     privacyfilter:
       enabled: true
       priority: 10
+      restore_responses: true
+      notice: true
+      data_dir: privacyfilter
 YAML
   exit 1
 fi
@@ -85,4 +88,6 @@ fi
 
 RULES="$(journalctl -u "${SERVICE}" --since "2 minutes ago" --no-pager | grep -o 'privacy filter loaded: [0-9]* rules' | tail -n1)"
 [[ -n "${RULES}" ]] && log "${RULES}"
+MODE="$(journalctl -u "${SERVICE}" --since "2 minutes ago" --no-pager | grep -o 'privacy filter mode: .*' | tail -n1 | tr -d '"')"
+[[ -n "${MODE}" ]] && log "${MODE}"
 log "done"

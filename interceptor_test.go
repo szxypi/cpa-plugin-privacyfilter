@@ -2,10 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
-
-	"github.com/rheodev/cpa-plugin-privacyfilter/internal/scan"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"github.com/tidwall/gjson"
@@ -17,16 +16,16 @@ func newTestPlugin(t testing.TB, mutate ...func(*privacyFilterConfig)) *privacyF
 	for _, m := range mutate {
 		m(&cfg)
 	}
-	scanner, err := newScanner(".", cfg)
+	p, err := assemblePlugin(cfg, ".", newStateRegistry(), func(format *placeholderFormat) *vault {
+		return newVault(format, []byte("0123456789abcdef0123456789abcdef"), cfg.vaultMaxEntries(), cfg.literalMinBytes())
+	})
 	if err != nil {
-		t.Fatalf("newScanner() error = %v", err)
+		t.Fatalf("assemblePlugin() error = %v", err)
 	}
-	return &privacyFilterPlugin{
-		cfg:     cfg,
-		scanner: scanner,
-		cache:   scan.NewCache(cfg.cacheEntries(), cfg.cacheBytes()),
-	}
+	return p
 }
+
+var rePlaceholder = regexp.MustCompile(`pf-(key|email|phone|idcard|ip|card)-[0-9a-f]{12}`)
 
 const (
 	sampleEmail = "test@example.com"
@@ -36,7 +35,7 @@ const (
 // redactString runs the interceptor and returns the rewritten body as a string.
 func redactString(t *testing.T, p *privacyFilterPlugin, body string) string {
 	t.Helper()
-	out, _ := p.redactRequestBody([]byte(body))
+	out, _, _ := p.redactRequestBody([]byte(body))
 	if out == nil {
 		return ""
 	}
@@ -55,7 +54,7 @@ func TestClaudeStringContent(t *testing.T) {
 	if strings.Contains(got, sampleEmail) {
 		t.Fatalf("email survived: %s", got)
 	}
-	if !strings.Contains(got, "[邮箱]") {
+	if !regexp.MustCompile(`my email is pf-email-[0-9a-f]{12}"`).MatchString(got) {
 		t.Fatalf("placeholder missing: %s", got)
 	}
 }
@@ -110,7 +109,7 @@ func TestClaudeThinkingBlockUntouched(t *testing.T) {
 	body := `{"model":"m","messages":[
 {"role":"assistant","content":[{"type":"thinking","thinking":"the token is ` + sampleToken + `","signature":"abc"}]},
 {"role":"user","content":"ok"}]}`
-	out, _ := p.redactRequestBody([]byte(body))
+	out, _, _ := p.redactRequestBody([]byte(body))
 	if out != nil {
 		t.Fatalf("thinking blocks must be replayed verbatim, got rewrite: %s", string(out))
 	}
@@ -120,7 +119,7 @@ func TestClaudeImageBlockSkipped(t *testing.T) {
 	p := newTestPlugin(t)
 	blob := strings.Repeat("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5", 100)
 	body := `{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + blob + `"}},{"type":"text","text":"see attached"}]}]}`
-	out, _ := p.redactRequestBody([]byte(body))
+	out, _, _ := p.redactRequestBody([]byte(body))
 	if out != nil {
 		t.Fatalf("no secrets present, body should pass through: %s", string(out))
 	}
@@ -137,7 +136,7 @@ func TestToolInputScannedAndDisabled(t *testing.T) {
 
 	disabled := false
 	off := newTestPlugin(t, func(c *privacyFilterConfig) { c.ScanToolInput = &disabled })
-	if out, _ := off.redactRequestBody([]byte(body)); out != nil {
+	if out, _, _ := off.redactRequestBody([]byte(body)); out != nil {
 		t.Fatalf("scan_tool_input=false must leave tool arguments alone: %s", string(out))
 	}
 }
@@ -225,7 +224,7 @@ func TestUntouchedBytesArePreserved(t *testing.T) {
 
 func TestNoHitReturnsNil(t *testing.T) {
 	p := newTestPlugin(t)
-	out, stats := p.redactRequestBody([]byte(`{"model":"m","messages":[{"role":"user","content":"hello world"}]}`))
+	out, stats, _ := p.redactRequestBody([]byte(`{"model":"m","messages":[{"role":"user","content":"hello world"}]}`))
 	if out != nil {
 		t.Fatalf("clean body must pass through untouched, got %s", string(out))
 	}
@@ -236,7 +235,7 @@ func TestNoHitReturnsNil(t *testing.T) {
 
 func TestInvalidJSONPassesThrough(t *testing.T) {
 	p := newTestPlugin(t)
-	out, _ := p.redactRequestBody([]byte(`not valid json with email ` + sampleEmail))
+	out, _, _ := p.redactRequestBody([]byte(`not valid json with email ` + sampleEmail))
 	if out != nil {
 		t.Fatalf("invalid JSON must pass through, got %s", string(out))
 	}
@@ -244,7 +243,7 @@ func TestInvalidJSONPassesThrough(t *testing.T) {
 
 func TestUnknownShapePassesThrough(t *testing.T) {
 	p := newTestPlugin(t)
-	out, _ := p.redactRequestBody([]byte(`{"unknown":{"payload":"email ` + sampleEmail + `"}}`))
+	out, _, _ := p.redactRequestBody([]byte(`{"unknown":{"payload":"email ` + sampleEmail + `"}}`))
 	if out != nil {
 		t.Fatalf("unsupported shape must pass through, got %s", string(out))
 	}
@@ -253,7 +252,7 @@ func TestUnknownShapePassesThrough(t *testing.T) {
 func TestRewrittenBodyDecodesIdentically(t *testing.T) {
 	p := newTestPlugin(t)
 	body := `{"model":"m","max_tokens":100,"messages":[{"role":"user","content":[{"type":"text","text":"mail ` + sampleEmail + ` done"}]}]}`
-	out, _ := p.redactRequestBody([]byte(body))
+	out, _, _ := p.redactRequestBody([]byte(body))
 	if out == nil {
 		t.Fatal("expected a rewrite")
 	}
@@ -268,7 +267,7 @@ func TestRewrittenBodyDecodesIdentically(t *testing.T) {
 		t.Fatalf("field count changed: %d -> %d", len(before), len(after))
 	}
 	text := gjson.GetBytes(out, "messages.0.content.0.text").String()
-	if text != "mail [邮箱] done" {
+	if !regexp.MustCompile(`^mail pf-email-[0-9a-f]{12} done$`).MatchString(text) {
 		t.Fatalf("unexpected redaction: %q", text)
 	}
 }
@@ -430,26 +429,29 @@ func TestConfigDefaults(t *testing.T) {
 }
 
 func TestRegistrationCapabilityJSON(t *testing.T) {
-	caps := abiCapabilities{RequestInterceptor: true}
+	caps := abiCapabilities{RequestInterceptor: true, ResponseInterceptor: true, StreamChunkInterceptor: true, RequestLifecyclePlugin: true}
 	raw, err := json.Marshal(caps)
 	if err != nil {
 		t.Fatalf("json.Marshal() error = %v", err)
 	}
-	if !strings.Contains(string(raw), `"request_interceptor":true`) {
-		t.Fatalf("expected request_interceptor in JSON: %s", string(raw))
+	for _, field := range []string{`"request_interceptor":true`, `"response_interceptor":true`, `"response_stream_interceptor":true`, `"request_lifecycle_plugin":true`} {
+		if !strings.Contains(string(raw), field) {
+			t.Fatalf("expected %s in JSON: %s", field, string(raw))
+		}
 	}
 }
 
 func TestBuildPluginMetadata(t *testing.T) {
-	plugin, err := buildPlugin([]byte("enabled: true\n"), ".")
+	plugin, err := buildPlugin([]byte("enabled: true\ndata_dir: "+t.TempDir()+"\n"), ".")
 	if err != nil {
 		t.Fatalf("buildPlugin() error = %v", err)
 	}
 	if plugin.Metadata.Name != pluginName || plugin.Metadata.Version != pluginVersion {
 		t.Fatalf("unexpected metadata: %+v", plugin.Metadata)
 	}
-	if plugin.Capabilities.RequestInterceptor == nil {
-		t.Fatal("request interceptor capability missing")
+	if plugin.Capabilities.RequestInterceptor == nil || plugin.Capabilities.ResponseInterceptor == nil ||
+		plugin.Capabilities.StreamChunkInterceptor == nil || plugin.Capabilities.RequestLifecyclePlugin == nil {
+		t.Fatal("a capability is missing")
 	}
 	if len(plugin.Metadata.ConfigFields) < 10 {
 		t.Fatalf("expected every config field to be advertised, got %d", len(plugin.Metadata.ConfigFields))
