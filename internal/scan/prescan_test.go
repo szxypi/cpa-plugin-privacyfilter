@@ -85,3 +85,54 @@ func TestPrescanGatesAreNecessaryConditions(t *testing.T) {
 		}
 	}
 }
+
+// TestStrongSecretContextStraddlingKeyword is the regression test for the
+// 2026-10-22 production crash (slice bounds out of range [33:30]).
+//
+// reSecretContext alternatives like "api[_\s-]?key" may contain a byte that is
+// not part of the entropy-token charset. Such a keyword can start in the
+// lookback window and end inside the candidate: here "api key" spans [0,7)
+// while the candidate starts at 4, on the "k" of "key". The old code sliced
+// region[7:4] and panicked. The keyword ends at or past the candidate start,
+// so nothing separates the two; that is the empty-gap case, which the existing
+// logic treats as strong context.
+func TestStrongSecretContextStraddlingKeyword(t *testing.T) {
+	const value = "Xk9Qm2Lp7Rt4Vw8Bn6Zc3"
+
+	cases := []struct {
+		name string
+		text string
+	}{
+		{"api key", "api key" + value},
+		{"access key", "access key" + value},
+		{"api\ttab\tkey", "api\tkey" + value},
+	}
+	for _, c := range cases {
+		start := strings.Index(c.text, "key")
+		if start < 0 {
+			t.Fatalf("%s: no candidate in %q", c.name, c.text)
+		}
+		if got := hasStrongSecretContext(c.text, start, len(c.text)); !got {
+			t.Fatalf("%s: hasStrongSecretContext(%q, %d, %d) = false, want true",
+				c.name, c.text, start, len(c.text))
+		}
+	}
+
+	// The straddling keyword must also survive the full scanner path that
+	// crashed in production, and still redact the value.
+	scanner := newTestScanner(t)
+	body := "config: api key" + value + "\n"
+	got := scanner.Redact(body)
+	if !got.Hit || got.Labels["[密钥]"] != 1 {
+		t.Fatalf("straddling keyword body not redacted: hit=%v labels=%v (%q)",
+			got.Hit, got.Labels, got.Redacted)
+	}
+
+	// A keyword far from the candidate, with letters in between, is still
+	// weak context: the fix must not widen the strong-context rule.
+	weak := "api key here now " + value
+	start := strings.Index(weak, value)
+	if hasStrongSecretContext(weak, start, len(weak)) {
+		t.Fatalf("weak context misclassified as strong: %q", weak)
+	}
+}

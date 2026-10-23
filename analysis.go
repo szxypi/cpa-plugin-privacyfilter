@@ -64,7 +64,10 @@ func (az *analyzer) analyze(text string) textAnalysis {
 		if az.skipTypes[typ] {
 			continue
 		}
-		if typ == typeIP && isBenignIP(text[sp.Start:sp.End]) {
+		if typ == typeIP && isBenignIP(text, sp.Start, sp.End) {
+			continue
+		}
+		if typ == typeCard && !plausibleCard(text, sp.Start, sp.End) {
 			continue
 		}
 		if overlapsAny(sp.Start, sp.End, out.placeholders) {
@@ -173,11 +176,69 @@ func looksLikeCode(value string) bool {
 	return codeKeywords[strings.ToLower(value)]
 }
 
-// isBenignIP skips addresses that identify nothing: loopback, the unspecified
-// address and netmasks.
-func isBenignIP(ip string) bool {
-	return strings.HasPrefix(ip, "127.") || ip == "0.0.0.0" || strings.HasPrefix(ip, "255.")
+// isBenignIP skips dotted quads that identify no host: loopback, the
+// unspecified address, netmasks, and version strings that only look like an
+// address (a kernel release with a "-microsoft" suffix, a "==" pin, a "v" prefix).
+func isBenignIP(text string, start, end int) bool {
+	ip := text[start:end]
+	if strings.HasPrefix(ip, "127.") || strings.HasPrefix(ip, "0.") || strings.HasPrefix(ip, "255.") {
+		return true
+	}
+	if start > 0 && isASCIILetter(text[start-1]) {
+		return true
+	}
+	if start >= 2 {
+		switch text[start-2 : start] {
+		case "==", ">=", "<=", "~=", "!=":
+			return true
+		}
+	}
+	// A letter after the dash ("-microsoft", "_rc1") marks a release tag. A
+	// digit after the dash (a range such as "a-b") stays an address.
+	if end+1 < len(text) && (text[end] == '-' || text[end] == '_') && isASCIILetter(text[end+1]) {
+		return true
+	}
+	return false
 }
+
+func isASCIILetter(c byte) bool { return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
+
+// plausibleCard keeps a Luhn-valid digit run only when it could be a payment
+// card. Luhn alone passes about one random number in ten, so timestamps,
+// decimal fractions and hex identifiers all matched. The scan package stays
+// identical to upstream; this filter runs on top of it.
+func plausibleCard(text string, start, end int) bool {
+	digits := text[start:end]
+	// Issuer ranges: 3 (Amex, JCB, Diners), 4 (Visa), 5 and 2221-2720
+	// (Mastercard), 6 (UnionPay, Discover, Maestro), 81 (UnionPay).
+	switch digits[0] {
+	case '3', '4', '5', '6':
+	case '2':
+		if len(digits) < 4 || digits[:4] < "2221" || digits[:4] > "2720" {
+			return false
+		}
+	case '8':
+		if digits[1] != '1' {
+			return false
+		}
+	default:
+		return false
+	}
+	// "costUSD":0.0912... is a fraction, not a card number.
+	if start >= 2 && text[start-1] == '.' && isDigit(text[start-2]) {
+		return false
+	}
+	// Hex identifiers and slugs glue the digits to letters.
+	if start > 0 && (isASCIILetter(text[start-1]) || text[start-1] == '_') {
+		return false
+	}
+	if end < len(text) && (isASCIILetter(text[end]) || text[end] == '_') {
+		return false
+	}
+	return true
+}
+
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 
 // analysisCache memoises analyses by content hash. Coding agents replay the
 // whole conversation every turn, so in steady state only new text is scanned.

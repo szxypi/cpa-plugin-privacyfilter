@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"sort"
 	"strings"
@@ -52,12 +53,23 @@ func (p *privacyFilterPlugin) InterceptRequestAfterAuth(ctx context.Context, req
 	return pluginapi.RequestInterceptResponse{}, nil
 }
 
-func (p *privacyFilterPlugin) interceptRequest(req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
-	resp := pluginapi.RequestInterceptResponse{}
+func (p *privacyFilterPlugin) interceptRequest(req pluginapi.RequestInterceptRequest) (resp pluginapi.RequestInterceptResponse, err error) {
+	resp = pluginapi.RequestInterceptResponse{}
 	body := req.Body
 	if len(body) == 0 {
 		return resp, nil
 	}
+	// Fail closed. The host ignores an error from a request hook and forwards
+	// the original body, so a scan failure must be reported as Terminate, which
+	// is the only result that stops the request. This defer covers the code
+	// outside forEachField; panics inside a worker goroutine are recovered
+	// there, because recover only works on the panicking goroutine.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logRecoveredPanic(hookRequestRedact, noField, string(body), recovered)
+			resp, err = terminateRequest(), nil
+		}
+	}()
 	// Every request gets a state, even an untouched one, so the response
 	// hooks can tell "nothing to restore" from "never saw this request".
 	st := &requestState{created: time.Now(), model: req.Model}
@@ -72,6 +84,11 @@ func (p *privacyFilterPlugin) interceptRequest(req pluginapi.RequestInterceptReq
 	}
 
 	modified, stats, values := p.redactRequestBody(body)
+	if stats.failed {
+		// A field scan panicked. forEachField recovered it, so the body may be
+		// half-processed; refuse the request instead of forwarding it.
+		return terminateRequest(), nil
+	}
 	if len(values) > 0 && p.cfg.restoreResponses() {
 		st.r = newRestorer(p.format, values)
 	}
@@ -102,6 +119,9 @@ type redactStats struct {
 	elapsed     time.Duration
 	cacheHits   uint64
 	cacheMisses uint64
+	// failed reports that a field scan panicked and was recovered. The caller
+	// must not forward the body.
+	failed bool
 }
 
 type fieldResult struct {
@@ -136,16 +156,23 @@ func (p *privacyFilterPlugin) redactRequestBody(body []byte) (_ []byte, stats re
 		stats.scanned += len(refs[i].value)
 	}
 
+	fieldText := func(i int) string { return refs[i].value }
+
 	// Phase 1 detects and registers every value, so phase 2's literal pass
 	// catches a value detected in one field wherever it reappears in another.
 	analyses := make([]textAnalysis, len(refs))
-	p.forEachField(len(refs), stats.scanned, func(i int) {
+	if p.forEachField(len(refs), stats.scanned, fieldText, func(i int) {
+		testPanic(stageScanField)
 		analyses[i] = p.cache.get(p.analyzer, refs[i].value)
 		text := refs[i].value
 		for _, s := range analyses[i].secrets {
 			p.vault.put(text[s.start:s.end], s.typ)
 		}
-	})
+	}) {
+		stats.failed = true
+		stats.elapsed = time.Since(started)
+		return nil, stats, nil
+	}
 
 	if p.vault.hasLiterals() {
 		seen := make(map[int]struct{}, len(refs))
@@ -158,9 +185,14 @@ func (p *privacyFilterPlugin) redactRequestBody(body []byte) (_ []byte, stats re
 		}
 	}
 	results := make([]fieldResult, len(refs))
-	p.forEachField(len(refs), stats.scanned, func(i int) {
-		results[i] = p.rewriteField(refs[i].value, analyses[i])
-	})
+	if p.forEachField(len(refs), stats.scanned, fieldText, func(i int) {
+		testPanic(stageRewriteField)
+		results[i] = p.rewriteField(refs[i].value, analyses[i], refs[i].jsonText)
+	}) {
+		stats.failed = true
+		stats.elapsed = time.Since(started)
+		return nil, stats, nil
+	}
 
 	edits := make([]edit, 0, 8)
 	for i := range results {
@@ -225,7 +257,7 @@ func (p *privacyFilterPlugin) existingPlaceholders(body []byte) map[string]strin
 	return values
 }
 
-func (p *privacyFilterPlugin) rewriteField(text string, analysis textAnalysis) fieldResult {
+func (p *privacyFilterPlugin) rewriteField(text string, analysis textAnalysis, jsonText bool) fieldResult {
 	result := fieldResult{text: text}
 	var reps []literalMatch
 	var skip []interval
@@ -261,7 +293,15 @@ func (p *privacyFilterPlugin) rewriteField(text string, analysis textAnalysis) f
 			continue // defensive: literal matches never overlap secrets
 		}
 		b.WriteString(text[prev:r.start])
-		b.WriteString(r.placeholder)
+		if jsonText && bareJSONNumber(text, r.start, r.end) {
+			// A bare number swapped for a placeholder would break the
+			// arguments JSON; a string keeps it parseable.
+			b.WriteByte('"')
+			b.WriteString(r.placeholder)
+			b.WriteByte('"')
+		} else {
+			b.WriteString(r.placeholder)
+		}
 		result.values[r.placeholder] = text[r.start:r.end]
 		prev = r.end
 	}
@@ -271,43 +311,98 @@ func (p *privacyFilterPlugin) rewriteField(text string, analysis textAnalysis) f
 	return result
 }
 
+// bareJSONNumber reports whether text[start:end] is a digit run that stands
+// alone as a JSON value: after ':' '[' or ',' and before ',' '}' ']' or space.
+func bareJSONNumber(text string, start, end int) bool {
+	for i := start; i < end; i++ {
+		if !isDigit(text[i]) {
+			return false
+		}
+	}
+	i := start - 1
+	for i >= 0 && (text[i] == ' ' || text[i] == '\t' || text[i] == '\n' || text[i] == '\r') {
+		i--
+	}
+	if i < 0 || (text[i] != ':' && text[i] != '[' && text[i] != ',') {
+		return false
+	}
+	return end == len(text) || strings.IndexByte(",}] \t\r\n", text[end]) >= 0
+}
+
 // parallelScanThreshold is the amount of text below which the goroutine
 // hand-off costs more than it saves.
 const parallelScanThreshold = 32 * 1024
 
-func (p *privacyFilterPlugin) forEachField(n, totalBytes int, fn func(i int)) {
+// forEachField runs fn over n fields, in this goroutine or across workers.
+// A panic inside fn is recovered on the goroutine that raised it and reported
+// through the return value; recover does not work across goroutines, so each
+// worker carries its own recover. fieldText supplies the text of field i for
+// the log line.
+func (p *privacyFilterPlugin) forEachField(n, totalBytes int, fieldText func(i int) string, fn func(i int)) (failed bool) {
+	run := func(i int, hook string) (ok bool) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				logRecoveredPanic(hook, i, fieldText(i), recovered)
+				ok = false
+			}
+		}()
+		fn(i)
+		return true
+	}
+
 	workers := p.cfg.workers()
 	if workers <= 1 || n < 2 || totalBytes < parallelScanThreshold {
 		for i := 0; i < n; i++ {
-			fn(i)
+			if !run(i, hookRequestSerial) {
+				return true
+			}
 		}
-		return
+		return false
 	}
 	workers = min(workers, n)
 	var next int64 = -1
+	var failedFlag atomic.Bool
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	for w := 0; w < workers; w++ {
 		go func() {
 			defer wg.Done()
 			for {
+				if failedFlag.Load() {
+					return
+				}
 				i := int(atomic.AddInt64(&next, 1))
 				if i >= n {
 					return
 				}
-				fn(i)
+				if !run(i, hookRequestWorker) {
+					failedFlag.Store(true)
+					return
+				}
 			}
 		}()
 	}
 	wg.Wait()
+	return failedFlag.Load()
 }
 
 // InterceptResponse restores placeholders in a non-streaming response.
-func (p *privacyFilterPlugin) InterceptResponse(ctx context.Context, req pluginapi.ResponseInterceptRequest) (pluginapi.ResponseInterceptResponse, error) {
-	resp := pluginapi.ResponseInterceptResponse{}
+func (p *privacyFilterPlugin) InterceptResponse(ctx context.Context, req pluginapi.ResponseInterceptRequest) (resp pluginapi.ResponseInterceptResponse, err error) {
+	resp = pluginapi.ResponseInterceptResponse{}
 	if !p.cfg.restoreResponses() || len(req.Body) == 0 {
 		return resp, nil
 	}
+	// A response-side failure only means "no restore". Returning the zero
+	// response makes the host send the original body, so this path needs no
+	// termination.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logRecoveredPanic(hookResponseAfter, noField, string(req.Body), recovered)
+			resp = pluginapi.ResponseInterceptResponse{}
+			err = nil
+		}
+	}()
+	testPanic(stageResponse)
 	st := p.states.take(req.RequestID)
 	if st == nil {
 		st = p.stateFromBody(req.OriginalRequest)
@@ -347,12 +442,38 @@ func startsWithJSON(body []byte) bool {
 }
 
 // InterceptStreamChunk restores placeholders in a streamed response.
-func (p *privacyFilterPlugin) InterceptStreamChunk(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
-	resp := pluginapi.StreamChunkInterceptResponse{}
+func (p *privacyFilterPlugin) InterceptStreamChunk(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (resp pluginapi.StreamChunkInterceptResponse, err error) {
+	resp = pluginapi.StreamChunkInterceptResponse{}
 	if !p.cfg.restoreResponses() {
 		return resp, nil
 	}
-	st := p.states.get(req.RequestID)
+	// A response-side failure only means "no restore", so this chunk goes out
+	// as it came in and DropChunk stays false. held is the bytes of an SSE
+	// "event:" line withheld by an earlier call: processChunk consumes held
+	// before it can panic, so the snapshot below is spliced back or that line
+	// would be lost for good, including a response.completed event.
+	//
+	// Not recovered: each channel's ch.tail. It is a fragment of a JSON string
+	// value, not raw chunk bytes, so it cannot be spliced back without the
+	// event it belongs to. The loss is bounded by one placeholder prefix
+	// length; the state is dropped below so no later chunk restores from it.
+	var held []byte
+	var st *requestState
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logRecoveredPanic(hookResponseChunk, noField, string(req.Body), recovered)
+			resp = pluginapi.StreamChunkInterceptResponse{}
+			err = nil
+			if st != nil {
+				p.states.take(req.RequestID)
+				if len(held) > 0 {
+					resp.Body = joinHeld(held, req.Body)
+				}
+			}
+		}
+	}()
+	testPanic(stageStreamChunk)
+	st = p.states.get(req.RequestID)
 	if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
 		if st == nil {
 			if st = p.stateFromBody(req.OriginalRequest); st == nil {
@@ -369,9 +490,14 @@ func (p *privacyFilterPlugin) InterceptStreamChunk(ctx context.Context, req plug
 	if st == nil || st.r == nil || len(req.Body) == 0 {
 		return resp, nil
 	}
+	// Snapshot under the state lock: processChunk clears st.held as it merges.
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if len(st.held) > 0 {
+		held = append([]byte(nil), st.held...)
+	}
 	out, drop := st.processChunk(req.SourceFormat, req.Body)
+	testPanic(stageStreamChunkMerge)
 	if drop {
 		resp.DropChunk = true
 		return resp, nil
@@ -382,6 +508,17 @@ func (p *privacyFilterPlugin) InterceptStreamChunk(ctx context.Context, req plug
 	return resp, nil
 }
 
+// joinHeld splices a withheld SSE line back in front of body, using the same
+// separator processChunk uses when it merges held into the next chunk.
+func joinHeld(held, body []byte) []byte {
+	out := make([]byte, 0, len(held)+1+len(body))
+	out = append(out, held...)
+	if !bytes.HasSuffix(out, []byte("\n")) {
+		out = append(out, '\n')
+	}
+	return append(out, body...)
+}
+
 // HandleRequestComplete forgets the request and reports what was restored.
 func (p *privacyFilterPlugin) HandleRequestComplete(ctx context.Context, completion pluginapi.RequestCompletion) error {
 	st := p.states.take(completion.RequestID)
@@ -389,16 +526,16 @@ func (p *privacyFilterPlugin) HandleRequestComplete(ctx context.Context, complet
 		return nil
 	}
 	st.mu.Lock()
-	restored, pending := st.restored, 0
+	restored, pending, unknown := st.restored, 0, st.r.unknown
 	for _, ch := range st.channels {
 		if ch.tail != "" {
 			pending++
 		}
 	}
 	st.mu.Unlock()
-	if restored > 0 || pending > 0 {
-		log.Infof("privacyfilter: restored %d placeholders model=%s outcome=%s status=%d unflushed=%d",
-			restored, completion.Model, completion.Outcome, completion.StatusCode, pending)
+	if restored > 0 || pending > 0 || unknown > 0 {
+		log.Infof("privacyfilter: restored %d placeholders model=%s outcome=%s status=%d unflushed=%d unknown=%d",
+			restored, completion.Model, completion.Outcome, completion.StatusCode, pending, unknown)
 	}
 	return nil
 }

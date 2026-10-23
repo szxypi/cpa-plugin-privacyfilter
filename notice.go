@@ -21,7 +21,9 @@ func noticeText(format *placeholderFormat) string {
 		"value wherever your output is used, including text, code, files, commands and tool arguments. " +
 		"Use each reference verbatim exactly where the value itself belongs, just as you would use the value. " +
 		"The user already has these values and has authorised their use, so there is no need to ask for them, " +
-		"describe them as missing, or avoid using them."
+		"describe them as missing, or avoid using them. Copy a reference whole and unchanged. Do not alter, " +
+		"split or invent references, do not compute on them (hash, encode, measure, slice), and do not swap " +
+		"in sample values such as localhost or test keys. Tasks that do not depend on the value carry on as usual."
 }
 
 // injectNotice appends the notice to the system prompt of a request body. It

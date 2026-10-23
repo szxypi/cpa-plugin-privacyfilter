@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.1
+
+### Fixed
+
+- Version strings that look like addresses are no longer replaced: a letter before the digits, a `==` `>=` `<=` `~=`
+  `!=` pin, a `-microsoft` style suffix, and any `0.` prefix. Live logs showed 813 thousand IP replacements in three
+  days. The share that were version strings was not measured.
+- Digit runs are replaced as cards only when the number starts with an issuer range (3, 4, 5, 6, 2221-2720, 81)
+  and has no letter, underscore or decimal point next to it. Decimal fractions and timestamps no longer match.
+- A bare number replaced inside tool-call `arguments` (a JSON text) is now quoted, so the arguments stay valid JSON.
+- `max_body_bytes` defaults to 32 MiB (was 4 MiB). In three days of live logs 1709 requests were forwarded unscanned
+  because they were over 4 MiB. A 14.5 MB body scans in about 0.5 s.
+
+### Changed
+
+- The notice now tells the model to copy references whole, not to alter, split, invent or compute on them, and not to
+  swap in sample values.
+- The completion log line has `unknown=N`: placeholder-shaped strings in a response that the request never sent.
+
 ## 0.4.0
 
 Reversible replacement. Sensitive values are replaced by placeholders on the way upstream and restored on the way

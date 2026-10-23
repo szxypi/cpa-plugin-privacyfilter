@@ -144,7 +144,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 }
 
 //export PrivacyFilterPluginCall
-func PrivacyFilterPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+func PrivacyFilterPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (rc C.int) {
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
@@ -153,6 +153,17 @@ func PrivacyFilterPluginCall(method *C.char, request *C.uint8_t, requestLen C.si
 		writeABIResponse(response, abiErrorEnvelope("invalid_method", "method is required"))
 		return 0
 	}
+	methodName := C.GoString(method)
+	// A Go panic must never cross the cgo boundary: the host cannot recover it
+	// and the whole CPA process dies. callPrivacyFilterABISafe covers the hook
+	// dispatch; this covers the C conversion and response writing around it.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logRecoveredPanic(hookABI+"/boundary/"+methodName, noField, "", recovered)
+			writeABIResponseGuarded(response, abiPanicEnvelope(methodName))
+			rc = 0
+		}
+	}()
 	var requestBytes []byte
 	if request != nil && requestLen > 0 {
 		if requestLen > maxCGoBytesLen {
@@ -161,13 +172,62 @@ func PrivacyFilterPluginCall(method *C.char, request *C.uint8_t, requestLen C.si
 		}
 		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
-	raw, errHandle := handlePrivacyFilterABIMethod(context.Background(), C.GoString(method), requestBytes)
-	if errHandle != nil {
-		writeABIResponse(response, abiErrorEnvelope("plugin_error", errHandle.Error()))
-		return 0
-	}
-	writeABIResponse(response, raw)
+	writeABIResponse(response, callPrivacyFilterABISafe(methodName, requestBytes))
 	return 0
+}
+
+// writeABIResponseGuarded writes the last-resort response. It runs inside a
+// recover handler, where a second panic would escape to the host.
+func writeABIResponseGuarded(response *C.cliproxy_buffer, raw []byte) {
+	defer func() { _ = recover() }()
+	writeABIResponse(response, raw)
+}
+
+// callPrivacyFilterABISafe dispatches one ABI method and converts every
+// failure into an envelope. It is the last line of defence, so it must not
+// panic itself: the recover converts a panic into the shape the host expects
+// for that method.
+func callPrivacyFilterABISafe(method string, request []byte) (raw []byte) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logRecoveredPanic(hookABI+"/"+method, noField, string(request), recovered)
+			raw = abiPanicEnvelope(method)
+		}
+	}()
+	testPanic(stageABI)
+	raw, errHandle := handlePrivacyFilterABIMethod(context.Background(), method, request)
+	if errHandle != nil {
+		return abiErrorEnvelope("plugin_error", errHandle.Error())
+	}
+	return raw
+}
+
+// abiPanicEnvelope answers a panicking call in the shape the host expects for
+// that call type. Request hooks fail closed with Terminate, response hooks
+// return the zero response so the original bytes go through, and every other
+// method answers a plain error.
+func abiPanicEnvelope(method string) []byte {
+	switch method {
+	case pluginabi.MethodRequestInterceptBefore, pluginabi.MethodRequestInterceptAfter:
+		return mustABIEnvelope(terminateRequest())
+	case pluginabi.MethodResponseInterceptAfter:
+		return mustABIEnvelope(pluginapi.ResponseInterceptResponse{})
+	case pluginabi.MethodResponseInterceptStreamChunk:
+		return emptyStreamChunkEnvelope
+	case pluginabi.MethodRequestComplete:
+		return mustABIEnvelope(struct{}{})
+	}
+	return abiErrorEnvelope("plugin_error", "privacyfilter panicked")
+}
+
+// mustABIEnvelope marshals a fixed, always-serialisable value; the error path
+// would itself be a bug, and a panic envelope must never fail.
+func mustABIEnvelope(v any) []byte {
+	raw, errMarshal := abiOKEnvelope(v)
+	if errMarshal != nil {
+		return abiErrorEnvelope("plugin_error", "privacyfilter panicked")
+	}
+	return raw
 }
 
 //export PrivacyFilterPluginFree

@@ -29,6 +29,10 @@ type restorer struct {
 	// prefixes holds every proper prefix of every placeholder in values. A
 	// streamed delta ending in one of them is held back until the next delta.
 	prefixes map[string]struct{}
+	// unknown counts placeholder-shaped strings in responses that this request
+	// never sent. The model made them up or copied them from elsewhere. They
+	// stay as they are; the count shows up in the completion log line.
+	unknown int
 }
 
 func newRestorer(format *placeholderFormat, values map[string]string) *restorer {
@@ -61,6 +65,7 @@ func (r *restorer) replace(s string, mode escMode) (string, int) {
 	for _, loc := range locs {
 		value, ok := r.values[s[loc[0]:loc[1]]]
 		if !ok {
+			r.unknown++
 			continue
 		}
 		if count == 0 {

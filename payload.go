@@ -11,6 +11,9 @@ type textRef struct {
 	index int
 	raw   string
 	value string
+	// jsonText marks a string that itself holds JSON text (tool-call
+	// arguments). A bare number replaced there must stay valid JSON.
+	jsonText bool
 }
 
 // walkOptions tunes which fields are collected.
@@ -103,10 +106,10 @@ func (c *collector) message(message gjson.Result) {
 	}
 	// OpenAI chat: assistant tool calls carry their arguments as a JSON string.
 	message.Get("tool_calls").ForEach(func(_, call gjson.Result) bool {
-		c.add(call.Get("function.arguments"))
+		c.addJSONText(call.Get("function.arguments"))
 		return true
 	})
-	c.add(message.Get("function_call.arguments"))
+	c.addJSONText(message.Get("function_call.arguments"))
 }
 
 // content handles the "content" field in both of its shapes: a bare string, or
@@ -152,7 +155,7 @@ func (c *collector) block(block gjson.Result, depth int) {
 			} else {
 				c.free(input, depth)
 			}
-			c.add(block.Get("arguments"))
+			c.addJSONText(block.Get("arguments"))
 			c.free(block.Get("action"), depth)
 			c.add(block.Get("output"))
 		}
@@ -292,6 +295,14 @@ func remainingStrings(body []byte, seen map[int]struct{}, minBytes int) []textRe
 		walk(gjson.ParseBytes(body), 0)
 	}
 	return out
+}
+
+// addJSONText records a string field that holds JSON text.
+func (c *collector) addJSONText(value gjson.Result) {
+	c.add(value)
+	if n := len(c.refs); n > 0 && c.refs[n-1].index == value.Index {
+		c.refs[n-1].jsonText = true
+	}
 }
 
 // add records a string field, skipping empties, duplicates and blobs.

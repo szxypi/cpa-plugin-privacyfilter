@@ -17,7 +17,7 @@ const privacyFilterProvider = "privacyfilter"
 const pluginName = "privacyfilter"
 
 const (
-	defaultMaxBodyBytes      = int64(4 << 20) // 4 MiB
+	defaultMaxBodyBytes      = int64(32 << 20) // 32 MiB
 	defaultCacheEntries      = 4096
 	defaultCacheBytes        = int64(64 << 20) // 64 MiB of cached analyses
 	defaultMaxWorkers        = 4

@@ -474,3 +474,300 @@ func TestAppendJSONString(t *testing.T) {
 		t.Fatalf("HTML must not be escaped, got %s", got)
 	}
 }
+
+// withPanicStage makes the named pipeline stage panic for the duration of fn.
+// It restores the seam on exit, including after a test failure.
+func withPanicStage(t *testing.T, stage string) {
+	t.Helper()
+	previous := panicInjector
+	panicInjector = func(current string) {
+		if current == stage {
+			panic("injected panic at " + stage)
+		}
+	}
+	t.Cleanup(func() { panicInjector = previous })
+}
+
+// bigMessagesBody builds a Claude body whose fields together exceed
+// parallelScanThreshold, so forEachField takes the worker path.
+func bigMessagesBody(fields int) string {
+	var b strings.Builder
+	b.WriteString(`{"model":"m","messages":[`)
+	for i := 0; i < fields; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString(`{"role":"user","content":"padding `)
+		b.WriteString(strings.Repeat("x", 12*1024))
+		b.WriteString(` mail `)
+		b.WriteString(sampleEmail)
+		b.WriteString(`"}`)
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+// TestRequestPanicSerialFailsClosed proves a scan panic on the serial path
+// refuses the request instead of forwarding a half-redacted body.
+func TestRequestPanicSerialFailsClosed(t *testing.T) {
+	p := newTestPlugin(t)
+	body := `{"model":"m","messages":[{"role":"user","content":"mail ` + sampleEmail + `"}]}`
+	withPanicStage(t, stageScanField)
+
+	resp, err := p.InterceptRequestBeforeAuth(nil, pluginapi.RequestInterceptRequest{RequestID: "s1", Model: "m", Body: []byte(body)})
+	if err != nil {
+		t.Fatalf("a refusal must be reported as Terminate, not an error: %v", err)
+	}
+	if !resp.Terminate {
+		t.Fatal("request panic did not terminate the request")
+	}
+	if resp.StatusCode != 403 {
+		t.Fatalf("termination status = %d, want 403", resp.StatusCode)
+	}
+	if len(resp.Body) != 0 {
+		t.Fatalf("a refused request must not carry a body, got %q", string(resp.Body))
+	}
+}
+
+// TestRequestPanicWorkerFailsClosed proves a panic inside a scan worker
+// goroutine is recovered on that goroutine, refuses the request, and does not
+// take the process down. Without the per-worker recover this test crashes the
+// test binary.
+func TestRequestPanicWorkerFailsClosed(t *testing.T) {
+	workers := 4
+	p := newTestPlugin(t, func(cfg *privacyFilterConfig) { cfg.Workers = &workers })
+	body := bigMessagesBody(4)
+	// Pin the preconditions forEachField uses to pick the worker path, so this
+	// test cannot silently degrade into a second serial-path test.
+	refs := collectTexts([]byte(body), walkOptions{ScanToolInput: false})
+	total := 0
+	for _, ref := range refs {
+		total += len(ref.value)
+	}
+	if len(refs) < 2 || total < parallelScanThreshold || p.cfg.workers() < 2 {
+		t.Fatalf("worker path not reachable: fields=%d bytes=%d workers=%d", len(refs), total, p.cfg.workers())
+	}
+	withPanicStage(t, stageScanField)
+
+	resp, err := p.InterceptRequestBeforeAuth(nil, pluginapi.RequestInterceptRequest{RequestID: "w1", Model: "m", Body: []byte(body)})
+	if err != nil {
+		t.Fatalf("a refusal must be reported as Terminate, not an error: %v", err)
+	}
+	if !resp.Terminate || resp.StatusCode != 403 || len(resp.Body) != 0 {
+		t.Fatalf("worker panic did not fail closed: %+v", resp)
+	}
+}
+
+// TestRequestPanicRewritePhaseFailsClosed covers the second forEachField pass,
+// which runs rewriteField rather than the detector.
+func TestRequestPanicRewritePhaseFailsClosed(t *testing.T) {
+	p := newTestPlugin(t)
+	body := `{"model":"m","messages":[{"role":"user","content":"mail ` + sampleEmail + `"}]}`
+	withPanicStage(t, stageRewriteField)
+
+	resp, err := p.InterceptRequestBeforeAuth(nil, pluginapi.RequestInterceptRequest{RequestID: "r1", Model: "m", Body: []byte(body)})
+	if err != nil || !resp.Terminate || resp.StatusCode != 403 {
+		t.Fatalf("rewrite panic did not fail closed: %+v %v", resp, err)
+	}
+}
+
+// TestResponsePanicPassesThrough proves a response-side panic only loses the
+// restore: the original body goes through, no termination is requested.
+func TestResponsePanicPassesThrough(t *testing.T) {
+	p := newTestPlugin(t)
+	redacted, values := redactFor(t, p, "resp1", formatClaude, `{"messages":[{"role":"user","content":"key `+sampleToken+`"}]}`)
+	if len(values) == 0 {
+		t.Fatal("expected a placeholder to restore")
+	}
+	body := []byte(redacted)
+	withPanicStage(t, stageResponse)
+
+	resp, err := p.InterceptResponse(nil, pluginapi.ResponseInterceptRequest{RequestID: "resp1", Model: "m", SourceFormat: formatClaude, Body: body})
+	if err != nil {
+		t.Fatalf("response panic must not surface an error: %v", err)
+	}
+	if len(resp.Body) != 0 {
+		t.Fatalf("response panic must leave the body untouched, got %q", string(resp.Body))
+	}
+	if resp.Headers != nil || resp.ClearHeaders != nil {
+		t.Fatalf("response panic must return a zero response, got %+v", resp)
+	}
+}
+
+// TestStreamChunkPanicPassesThrough proves a stream-chunk panic neither drops
+// the chunk nor rewrites it.
+func TestStreamChunkPanicPassesThrough(t *testing.T) {
+	p := newTestPlugin(t)
+	_, values := redactFor(t, p, "chunk1", formatClaude, `{"messages":[{"role":"user","content":"key `+sampleToken+`"}]}`)
+	if len(values) == 0 {
+		t.Fatal("expected a placeholder to restore")
+	}
+	withPanicStage(t, stageStreamChunk)
+
+	resp, err := p.InterceptStreamChunk(nil, pluginapi.StreamChunkInterceptRequest{
+		RequestID: "chunk1", SourceFormat: formatClaude, ChunkIndex: 0,
+		Body: []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n"),
+	})
+	if err != nil {
+		t.Fatalf("stream chunk panic must not surface an error: %v", err)
+	}
+	if resp.DropChunk || len(resp.Body) != 0 {
+		t.Fatalf("stream chunk panic must pass the chunk through: %+v", resp)
+	}
+}
+
+// TestStreamChunkPanicReleasesHeldEvent covers the withheld SSE line: the
+// Responses stream holds an "event:" line until its "data:" line arrives, and
+// processChunk clears held before it can panic. The recover must splice the
+// held bytes back in and drop the state, or a response.completed event would
+// be lost and later chunks would keep restoring from a half-updated state.
+func TestStreamChunkPanicReleasesHeldEvent(t *testing.T) {
+	p := newTestPlugin(t)
+	_, values := redactFor(t, p, "held1", formatResponses, `{"messages":[{"role":"user","content":"key `+sampleToken+`"}]}`)
+	if len(values) == 0 {
+		t.Fatal("expected a placeholder to restore")
+	}
+
+	// A lone "event:" line is withheld by the previous call.
+	heldLine := "event: response.completed"
+	first, err := p.InterceptStreamChunk(nil, pluginapi.StreamChunkInterceptRequest{
+		RequestID: "held1", SourceFormat: formatResponses, ChunkIndex: 0,
+		Body: []byte(heldLine),
+	})
+	if err != nil {
+		t.Fatalf("stream chunk error = %v", err)
+	}
+	if !first.DropChunk || len(first.Body) != 0 {
+		t.Fatalf("a lone event line must be withheld, got %+v", first)
+	}
+
+	// The next chunk panics after the held line has been merged and cleared.
+	withPanicStage(t, stageStreamChunkMerge)
+	secondBody := []byte("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n")
+	second, err := p.InterceptStreamChunk(nil, pluginapi.StreamChunkInterceptRequest{
+		RequestID: "held1", SourceFormat: formatResponses, ChunkIndex: 1,
+		Body: secondBody,
+	})
+	if err != nil {
+		t.Fatalf("stream chunk panic must not surface an error: %v", err)
+	}
+	if second.DropChunk {
+		t.Fatal("a recovered chunk must not be dropped")
+	}
+	if !strings.Contains(string(second.Body), heldLine) {
+		t.Fatalf("the withheld event line was lost: %q", string(second.Body))
+	}
+	if !strings.Contains(string(second.Body), string(secondBody)) {
+		t.Fatalf("the current chunk was lost: %q", string(second.Body))
+	}
+
+	// The state is gone, so later chunks pass through untouched even though
+	// their body carries a placeholder that used to be restorable.
+	placeholder := placeholderFor(t, values, sampleToken)
+	third, err := p.InterceptStreamChunk(nil, pluginapi.StreamChunkInterceptRequest{
+		RequestID: "held1", SourceFormat: formatResponses, ChunkIndex: 2,
+		Body: []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"" + placeholder + "\"}\n\n"),
+	})
+	if err != nil {
+		t.Fatalf("stream chunk error = %v", err)
+	}
+	if third.DropChunk || len(third.Body) != 0 {
+		t.Fatalf("a dropped state must pass later chunks through: %+v", third)
+	}
+	if p.states.get("held1") != nil {
+		t.Fatal("the failed request state must be removed")
+	}
+}
+
+// TestABIPanicBoundaryAnswersPerCallType proves the C/Go boundary converts a
+// panic into the envelope shape the host expects for each call type.
+func TestABIPanicBoundaryAnswersPerCallType(t *testing.T) {
+	p := newTestPlugin(t)
+	privacyFilterABIState.Lock()
+	privacyFilterABIState.plugin = p
+	privacyFilterABIState.shuttingDown = false
+	privacyFilterABIState.Unlock()
+	withPanicStage(t, stageABI)
+
+	requestHook := callPrivacyFilterABISafe("request.intercept_before", []byte(`{"RequestID":"a","Body":{}}`))
+	var reqEnvelope struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Terminate  bool `json:"Terminate"`
+			StatusCode int  `json:"StatusCode"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(requestHook, &reqEnvelope); err != nil {
+		t.Fatalf("request envelope is not JSON: %v (%s)", err, string(requestHook))
+	}
+	if !reqEnvelope.OK || !reqEnvelope.Result.Terminate || reqEnvelope.Result.StatusCode != 403 {
+		t.Fatalf("request hook panic must fail closed: %s", string(requestHook))
+	}
+
+	responseHook := callPrivacyFilterABISafe("response.intercept_after", []byte(`{"RequestID":"a","Body":{}}`))
+	if !strings.Contains(string(responseHook), `"ok":true`) {
+		t.Fatalf("response hook panic must answer OK: %s", string(responseHook))
+	}
+	if strings.Contains(string(responseHook), "Terminate") {
+		t.Fatalf("response hook must not terminate: %s", string(responseHook))
+	}
+
+	chunkHook := callPrivacyFilterABISafe("response.intercept_stream_chunk", []byte(`{"RequestID":"a","ChunkIndex":0}`))
+	if string(chunkHook) != string(emptyStreamChunkEnvelope) {
+		t.Fatalf("stream chunk panic must answer the empty chunk envelope: %s", string(chunkHook))
+	}
+}
+
+// Values are assembled at run time so the source holds no literal that a
+// privacy proxy in front of the editor would rewrite.
+func TestVersionStringsAndNumbersAreNotAddressesOrCards(t *testing.T) {
+	p := newTestPlugin(t)
+	dot := "."
+	kernel := "5" + dot + "15" + dot + "167" + dot + "4"
+	pkg := "1" + dot + "24" + dot + "3" + dot + "9"
+	host := "10" + dot + "20" + dot + "30" + dot + "40"
+	fraction := "0" + dot + "0912345678901234"
+	stamp := "1729" + "612345678" + "901"
+	card := "4111" + "1111" + "1111" + "1111"
+
+	cases := []struct {
+		name, text string
+		wantTyp    string // "" means nothing is replaced
+	}{
+		{"kernel release tag", "Linux " + kernel + "-microsoft-standard-WSL2", ""},
+		{"pinned package", "numpy==" + pkg, ""},
+		{"v prefix", "release v" + pkg, ""},
+		{"real host", "connect to " + host + " now", typeIP},
+		{"decimal fraction", `"costUSD":` + fraction, ""},
+		{"timestamp", "startTime " + stamp, ""},
+		{"real card", "card " + card + " expires", typeCard},
+	}
+	for _, c := range cases {
+		a := p.analyzer.analyze(c.text)
+		got := ""
+		if len(a.secrets) > 0 {
+			got = a.secrets[0].typ
+		}
+		if got != c.wantTyp {
+			t.Errorf("%s: detected %q, want %q (%q)", c.name, got, c.wantTyp, c.text)
+		}
+	}
+}
+
+func TestBareNumberInToolArgumentsStaysValidJSON(t *testing.T) {
+	p := newTestPlugin(t)
+	phone := "138" + "0013" + "8000"
+	args := `{\"phone\":` + phone + `,\"note\":\"x\"}`
+	body := `{"model":"m","messages":[{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"call","arguments":"` + args + `"}}]}]}`
+	got := redactString(t, p, body)
+	if got == "" {
+		t.Fatal("expected a rewritten body")
+	}
+	rewritten := gjson.Get(got, "messages.0.tool_calls.0.function.arguments").String()
+	if !gjson.Valid(rewritten) {
+		t.Fatalf("arguments are no longer JSON: %s", rewritten)
+	}
+	if strings.Contains(rewritten, phone) {
+		t.Fatalf("phone survived: %s", rewritten)
+	}
+}

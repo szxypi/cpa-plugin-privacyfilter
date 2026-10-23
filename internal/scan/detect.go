@@ -257,6 +257,12 @@ func hasStrongSecretContext(text string, start, end int) bool {
 	if last[0] >= candStartInRegion {
 		return true
 	}
+	// A keyword alternative with a non-token byte inside it ("api key",
+	// "access key") can start before the candidate and end inside it. Then no
+	// byte separates keyword and candidate, which is the empty-gap case below.
+	if last[1] > candStartInRegion {
+		return true
+	}
 	between := region[last[1]:candStartInRegion]
 	for i := 0; i < len(between); i++ {
 		if strings.IndexByte(assignmentChars, between[i]) < 0 {

@@ -188,7 +188,7 @@ plugins:
       # 不替换的类型：key、email、phone、idcard、ip、card
       # skip_types: [ip]
       # 超过该大小的请求体直接放行不扫描；-1 表示不限制
-      max_body_bytes: 4194304
+      max_body_bytes: 33554432
       # 除消息正文外，也扫描工具调用参数与工具结果
       scan_tool_input: true
       # 记住扫过的文本；编码代理每轮都会重放整段历史
@@ -218,7 +218,7 @@ plugins:
 | `skip_models`     | array   | `[]`       | 跳过脱敏的模型（同时匹配路由后模型与客户端请求的模型）。            |
 | `skip_formats`    | array   | `[]`       | 跳过脱敏的来源格式。                                             |
 | `disable_rules`   | array   | `[]`       | 按 id 关闭 gitleaks 规则。`generic-api-key` 约占 60% 耗时且误报最多。 |
-| `max_body_bytes`  | integer | `4194304`  | 超过该字节数的请求体不扫描。`-1` 表示不限制。                        |
+| `max_body_bytes`  | integer | `33554432` | 超过该字节数的请求体不扫描。`-1` 表示不限制。                        |
 | `scan_tool_input` | boolean | `true`     | 是否扫描工具调用参数与工具结果。                                    |
 | `cache_entries`   | integer | `4096`     | 跨请求记住的文本条数，`0` 关闭缓存。                                |
 | `cache_bytes`     | integer | `67108864` | 检测结果缓存的字节预算（只存偏移，不存值）。                          |

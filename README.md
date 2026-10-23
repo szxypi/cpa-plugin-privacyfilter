@@ -198,7 +198,7 @@ plugins:
       enabled: true
       priority: 10
       # Bodies above this are forwarded unscanned; -1 disables the limit.
-      max_body_bytes: 4194304
+      max_body_bytes: 33554432
       # Scan tool-call arguments and tool results, not just message text.
       scan_tool_input: true
       # Remember scanned text between turns; agents replay the whole history.
@@ -220,7 +220,7 @@ Plugin fields:
 | `skip_models`     | array   | `[]`       | Models that should skip redaction (matched against both the routed and the requested model).  |
 | `skip_formats`    | array   | `[]`       | Source formats that should skip redaction.                                                    |
 | `disable_rules`   | array   | `[]`       | Gitleaks rule ids to drop. `generic-api-key` is ~60% of scan time and most false positives.   |
-| `max_body_bytes`  | integer | `4194304`  | Skip bodies larger than this. `-1` means no limit.                                            |
+| `max_body_bytes`  | integer | `33554432` | Skip bodies larger than this. `-1` means no limit.                                            |
 | `scan_tool_input` | boolean | `true`     | Include tool-call arguments and tool results.                                                 |
 | `cache_entries`   | integer | `4096`     | Texts remembered between requests. `0` disables the cache.                                    |
 | `cache_bytes`     | integer | `67108864` | Byte budget for cached redacted text.                                                         |

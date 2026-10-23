@@ -10,7 +10,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-var pluginVersion = "0.4.0"
+var pluginVersion = "0.4.1"
 
 // assemblePlugin builds a plugin instance around a vault chosen by vaultFor.
 func assemblePlugin(cfg privacyFilterConfig, pluginDir string, states *stateRegistry, vaultFor func(*placeholderFormat) *vault) (*privacyFilterPlugin, error) {
@@ -155,7 +155,7 @@ func buildPlugin(configYAML []byte, pluginDir string) (pluginapi.Plugin, error) 
 				{
 					Name:        "max_body_bytes",
 					Type:        pluginapi.ConfigFieldTypeInteger,
-					Description: "超过该字节数的请求体不处理，默认 4194304，负数表示不限。",
+					Description: "超过该字节数的请求体不处理，默认 33554432，负数表示不限。",
 				},
 				{
 					Name:        "scan_tool_input",

@@ -63,7 +63,8 @@ for stale in "${PLUGIN_DIR}/${PLUGIN_ID}-v"*.so; do
   fi
 done
 
-systemctl restart "${SERVICE}"
+# Wait for in-flight requests first: a restart under load crashed CPA in the past.
+/usr/local/sbin/cli-proxy-api-restart
 sleep 5
 systemctl is-active --quiet "${SERVICE}" || { log "${SERVICE} did not come back up"; exit 1; }
 
