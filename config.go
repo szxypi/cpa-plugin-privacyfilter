@@ -30,7 +30,11 @@ const (
 type privacyFilterConfig struct {
 	GitleaksTOML string   `yaml:"gitleaks_toml"`
 	SkipModels   []string `yaml:"skip_models"`
-	SkipFormats  []string `yaml:"skip_formats"`
+	// SkipModelPrefixes leaves every model whose requested or upstream name
+	// starts with one of these prefixes untouched. Matching is case-insensitive
+	// and checked before any redaction.
+	SkipModelPrefixes []string `yaml:"skip_model_prefixes"`
+	SkipFormats       []string `yaml:"skip_formats"`
 	// DisableRules drops gitleaks rules by id. "generic-api-key" is both the
 	// most expensive rule in the set and its biggest source of false
 	// positives; dropping it roughly halves scan time.
@@ -205,6 +209,15 @@ func (cfg *privacyFilterConfig) shouldSkip(model, requestedModel, format string)
 	for _, m := range cfg.SkipModels {
 		trimmed := strings.TrimSpace(m)
 		if strings.EqualFold(trimmed, model) || strings.EqualFold(trimmed, requestedModel) {
+			return true
+		}
+	}
+	for _, p := range cfg.SkipModelPrefixes {
+		prefix := strings.ToLower(strings.TrimSpace(p))
+		if prefix == "" {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(model), prefix) || strings.HasPrefix(strings.ToLower(requestedModel), prefix) {
 			return true
 		}
 	}

@@ -371,6 +371,113 @@ func TestConfigShouldSkip(t *testing.T) {
 	}
 }
 
+func TestConfigShouldSkipPrefixes(t *testing.T) {
+	cfg := privacyFilterConfig{SkipModelPrefixes: []string{"reclaude-"}}
+	if !cfg.shouldSkip("reclaude-claude-opus-5-5", "", "") {
+		t.Fatal("should skip a model matched by prefix")
+	}
+	if !cfg.shouldSkip("upstream-model", "reclaude-claude-opus-5-5", "") {
+		t.Fatal("should skip a requested model matched by prefix")
+	}
+	if !cfg.shouldSkip("RECLAUDE-claude-opus-5-5", "", "") {
+		t.Fatal("prefix matching must be case-insensitive")
+	}
+	if cfg.shouldSkip("claude-opus-5-5", "", "") {
+		t.Fatal("should not skip an unrelated model")
+	}
+	if cfg.shouldSkip("xreclaude-y", "", "") {
+		t.Fatal("prefix matching must not match mid-string")
+	}
+	// An empty prefix list must not change behaviour.
+	empty := privacyFilterConfig{}
+	if empty.shouldSkip("reclaude-x", "reclaude-x", "") {
+		t.Fatal("empty skip_model_prefixes must skip nothing")
+	}
+}
+
+func TestInterceptRequest_SkippedModelPrefix(t *testing.T) {
+	p := newTestPlugin(t, func(c *privacyFilterConfig) { c.SkipModelPrefixes = []string{"reclaude-"} })
+	body := `{"model":"reclaude-claude-opus-5-5","messages":[{"role":"user","content":"my email is ` + sampleEmail + `"}]}`
+	resp, err := p.interceptRequest(pluginapi.RequestInterceptRequest{RequestID: "skip-prefix", Model: "reclaude-claude-opus-5-5", Body: []byte(body)})
+	if err != nil {
+		t.Fatalf("interceptRequest() error = %v", err)
+	}
+	if resp.Body != nil {
+		t.Fatalf("expected prefix-skipped model to pass through, got: %s", string(resp.Body))
+	}
+	// The response side must not restore or rewrite either: no restorer is
+	// registered for a skipped request.
+	if st := p.states.get("skip-prefix"); st != nil && st.r != nil {
+		t.Fatal("a skipped request must not register a restorer")
+	}
+}
+
+// TestSkippedPrefixResponseUntouched proves the response path stays quiet for a
+// skipped model: the placeholder-shaped text in the response is left as-is.
+func TestSkippedPrefixResponseUntouched(t *testing.T) {
+	p := newTestPlugin(t, func(c *privacyFilterConfig) { c.SkipModelPrefixes = []string{"reclaude-"} })
+	body := `{"model":"reclaude-claude-opus-5-5","messages":[{"role":"user","content":"my email is ` + sampleEmail + `"}]}`
+	req := pluginapi.RequestInterceptRequest{RequestID: "skip-resp", Model: "reclaude-claude-opus-5-5", Body: []byte(body)}
+	if resp, err := p.interceptRequest(req); err != nil || resp.Body != nil {
+		t.Fatalf("skipped request must pass through: %+v %v", resp, err)
+	}
+	responseBody := []byte(`{"content":[{"type":"text","text":"contact ` + sampleEmail + `"}]}`)
+	resp, err := p.InterceptResponse(nil, pluginapi.ResponseInterceptRequest{RequestID: "skip-resp", Model: "reclaude-claude-opus-5-5", SourceFormat: formatClaude, Body: responseBody})
+	if err != nil {
+		t.Fatalf("InterceptResponse() error = %v", err)
+	}
+	if resp.Body != nil {
+		t.Fatalf("a skipped model's response must not be rewritten, got: %s", string(resp.Body))
+	}
+}
+
+func TestInterceptRequest_PrefixSkipDoesNotAffectOtherModels(t *testing.T) {
+	p := newTestPlugin(t, func(c *privacyFilterConfig) { c.SkipModelPrefixes = []string{"reclaude-"} })
+	body := `{"model":"claude-opus-5-5","messages":[{"role":"user","content":"my email is ` + sampleEmail + `"}]}`
+	resp, err := p.interceptRequest(pluginapi.RequestInterceptRequest{RequestID: "keep", Model: "claude-opus-5-5", Body: []byte(body)})
+	if err != nil {
+		t.Fatalf("interceptRequest() error = %v", err)
+	}
+	if resp.Body == nil {
+		t.Fatal("a non-excluded model must still be redacted")
+	}
+	if strings.Contains(string(resp.Body), sampleEmail) {
+		t.Fatalf("email survived: %s", string(resp.Body))
+	}
+}
+
+// TestSkipModelPrefixesWinsOverNothingToInclude pins precedence against
+// skip_models: a model named exactly in skip_models and matched by a prefix is
+// skipped either way, and a model that only the prefix matches is skipped too.
+func TestSkipModelPrefixesWinsOverSkipModels(t *testing.T) {
+	cfg := privacyFilterConfig{
+		SkipModels:        []string{"reclaude-claude-opus-5-5"},
+		SkipModelPrefixes: []string{"reclaude-"},
+	}
+	if !cfg.shouldSkip("reclaude-claude-opus-5-5", "", "") {
+		t.Fatal("both rules must skip the same model")
+	}
+	if !cfg.shouldSkip("reclaude-claude-haiku-5-5", "", "") {
+		t.Fatal("the prefix rule alone must skip")
+	}
+	if cfg.shouldSkip("claude-opus-5-5", "", "") {
+		t.Fatal("an unrelated model must not be skipped")
+	}
+}
+
+func TestSkipModelPrefixesParsesFromYAML(t *testing.T) {
+	cfg, err := parseConfig([]byte("skip_model_prefixes:\n  - \"reclaude-\"\n"))
+	if err != nil {
+		t.Fatalf("parseConfig() error = %v", err)
+	}
+	if len(cfg.SkipModelPrefixes) != 1 || cfg.SkipModelPrefixes[0] != "reclaude-" {
+		t.Fatalf("skip_model_prefixes = %v", cfg.SkipModelPrefixes)
+	}
+	if len(defaultConfig().SkipModelPrefixes) != 0 {
+		t.Fatal("skip_model_prefixes must default to empty")
+	}
+}
+
 func TestConfigParse(t *testing.T) {
 	raw := `
 skip_models:

@@ -1,5 +1,5 @@
 PLUGIN_NAME ?= privacyfilter
-VERSION ?= 0.4.1
+VERSION ?= 0.4.2
 BUILD_DIR ?= .
 DIST_DIR ?= dist
 GOOS ?= $(shell go env GOOS)

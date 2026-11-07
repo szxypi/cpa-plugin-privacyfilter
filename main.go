@@ -10,7 +10,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-var pluginVersion = "0.4.1"
+var pluginVersion = "0.4.2"
 
 // assemblePlugin builds a plugin instance around a vault chosen by vaultFor.
 func assemblePlugin(cfg privacyFilterConfig, pluginDir string, states *stateRegistry, vaultFor func(*placeholderFormat) *vault) (*privacyFilterPlugin, error) {
@@ -141,6 +141,11 @@ func buildPlugin(configYAML []byte, pluginDir string) (pluginapi.Plugin, error) 
 					Name:        "skip_models",
 					Type:        pluginapi.ConfigFieldTypeArray,
 					Description: "不处理的模型名。",
+				},
+				{
+					Name:        "skip_model_prefixes",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "不处理的模型名前缀（大小写不敏感，同时比对 Model 与 RequestedModel）。命中的请求请求侧与响应侧都不改写。",
 				},
 				{
 					Name:        "skip_formats",
