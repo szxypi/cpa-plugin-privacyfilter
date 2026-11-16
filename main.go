@@ -10,7 +10,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-var pluginVersion = "0.4.2"
+var pluginVersion = "0.5.0"
 
 // assemblePlugin builds a plugin instance around a vault chosen by vaultFor.
 func assemblePlugin(cfg privacyFilterConfig, pluginDir string, states *stateRegistry, vaultFor func(*placeholderFormat) *vault) (*privacyFilterPlugin, error) {
@@ -22,6 +22,10 @@ func assemblePlugin(cfg privacyFilterConfig, pluginDir string, states *stateRegi
 	if errSkip != nil {
 		return nil, errSkip
 	}
+	allowRegexes, allowStopwords, errAllow := cfg.compileAllowlist()
+	if errAllow != nil {
+		return nil, errAllow
+	}
 	scanner, errScanner := newScanner(pluginDir, cfg)
 	if errScanner != nil {
 		return nil, errScanner
@@ -30,10 +34,16 @@ func assemblePlugin(cfg privacyFilterConfig, pluginDir string, states *stateRegi
 		cfg:       cfg,
 		pluginDir: pluginDir,
 		format:    format,
-		analyzer:  &analyzer{scanner: scanner, format: format, skipTypes: skipTypes},
-		cache:     newAnalysisCache(cfg.cacheEntries(), cfg.cacheBytes()),
-		vault:     vaultFor(format),
-		states:    states,
+		analyzer: &analyzer{
+			scanner:        scanner,
+			format:         format,
+			skipTypes:      skipTypes,
+			allowRegexes:   allowRegexes,
+			allowStopwords: allowStopwords,
+		},
+		cache:  newAnalysisCache(cfg.cacheEntries(), cfg.cacheBytes()),
+		vault:  vaultFor(format),
+		states: states,
 	}
 	if cfg.notice() {
 		p.notice = noticeText(format)
@@ -156,6 +166,16 @@ func buildPlugin(configYAML []byte, pluginDir string) (pluginapi.Plugin, error) 
 					Name:        "disable_rules",
 					Type:        pluginapi.ConfigFieldTypeArray,
 					Description: "停用的 gitleaks 规则 id；停用 generic-api-key 约省一半扫描时间。",
+				},
+				{
+					Name:        "allowlist_regexes",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "白名单正则表达式（RE2），命中的候选值保留明文不替换。",
+				},
+				{
+					Name:        "allowlist_stopwords",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "白名单停用词（大小写不敏感子串），包含任一词的候选值保留明文不替换。",
 				},
 				{
 					Name:        "max_body_bytes",

@@ -221,7 +221,8 @@ def main() -> None:
             raise AssertionError(f"unexpected plugin name: {metadata['Name']}")
         advertised = {field["Name"] for field in metadata["ConfigFields"]}
         expected = {
-            "gitleaks_toml", "skip_models", "skip_formats", "disable_rules",
+            "gitleaks_toml", "skip_models", "skip_model_prefixes", "skip_formats",
+            "disable_rules", "allowlist_regexes", "allowlist_stopwords",
             "max_body_bytes", "scan_tool_input", "cache_entries", "cache_bytes",
             "workers", "log_stats", "placeholder_style", "placeholder_prefix",
             "restore_responses", "notice", "skip_types", "data_dir",

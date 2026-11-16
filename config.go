@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 
@@ -39,6 +40,12 @@ type privacyFilterConfig struct {
 	// most expensive rule in the set and its biggest source of false
 	// positives; dropping it roughly halves scan time.
 	DisableRules []string `yaml:"disable_rules"`
+	// AllowlistRegexes leaves candidate values matching any of these RE2
+	// regular expressions in clear text.
+	AllowlistRegexes []string `yaml:"allowlist_regexes"`
+	// AllowlistStopwords leaves candidate values containing any of these
+	// case-insensitive substrings in clear text.
+	AllowlistStopwords []string `yaml:"allowlist_stopwords"`
 	// MaxBodyBytes skips bodies larger than this. 0 means no limit.
 	MaxBodyBytes *int64 `yaml:"max_body_bytes"`
 	// ScanToolInput includes tool-call arguments and tool results.
@@ -170,6 +177,29 @@ func (cfg *privacyFilterConfig) skipTypes() (map[string]bool, error) {
 		out[typ] = true
 	}
 	return out, nil
+}
+
+func (cfg *privacyFilterConfig) compileAllowlist() ([]*regexp.Regexp, *scan.KeywordMatcher, error) {
+	var regexes []*regexp.Regexp
+	for _, raw := range cfg.AllowlistRegexes {
+		expr := strings.TrimSpace(raw)
+		if expr == "" {
+			continue
+		}
+		re, err := regexp.Compile(expr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("allowlist_regexes: invalid regex %q: %w", raw, err)
+		}
+		regexes = append(regexes, re)
+	}
+	var words []string
+	for _, raw := range cfg.AllowlistStopwords {
+		w := strings.ToLower(strings.TrimSpace(raw))
+		if w != "" {
+			words = append(words, w)
+		}
+	}
+	return regexes, scan.NewKeywordMatcher(words), nil
 }
 
 func (cfg *privacyFilterConfig) workers() int {

@@ -30,8 +30,9 @@ type Result struct {
 // Scanner holds the compiled rule set. It is read-only after construction and
 // safe for concurrent use.
 type Scanner struct {
-	rules   []Rule
-	skipped int
+	rules       []Rule
+	skipped     int
+	globalAllow []allowlist
 
 	matcher *matcher
 	// ruleKeywordIDs[i] lists matcher pattern ids for rules[i]; empty means
@@ -84,6 +85,9 @@ var byteClass = func() [256]uint8 {
 // source document had a regex Go's RE2 engine rejected.
 func New(rules []Rule, skipped int) *Scanner {
 	s := &Scanner{rules: rules, skipped: skipped}
+	if len(rules) > 0 {
+		s.globalAllow = rules[0].globalAllowlists
+	}
 
 	ids := make(map[string]int32)
 	var patterns []string
@@ -160,6 +164,50 @@ type Span struct {
 	MinEntropy float64
 	// Rule is the gitleaks rule id for SourceRule spans.
 	Rule string
+	// RuleIndex indexes into Scanner.rules when Source is SourceRule.
+	RuleIndex int
+}
+
+// Allowlisted reports whether sp is excluded by the Gitleaks global allowlist
+// or, for a SourceRule span, by that rule's own allowlists. valueStart and
+// valueEnd give the narrowed secret span inside text.
+func (s *Scanner) Allowlisted(text string, sp Span, valueStart, valueEnd int) bool {
+	if s == nil || valueStart < 0 || valueStart >= valueEnd || valueEnd > len(text) {
+		return false
+	}
+	var ruleAllow []allowlist
+	if sp.Source == SourceRule && sp.RuleIndex >= 0 && sp.RuleIndex < len(s.rules) {
+		ruleAllow = s.rules[sp.RuleIndex].allowlists
+	}
+	if len(s.globalAllow) == 0 && len(ruleAllow) == 0 {
+		return false
+	}
+	secret := text[valueStart:valueEnd]
+	fullStart, fullEnd := sp.Start, sp.End
+	if fullStart < 0 || fullStart >= fullEnd || fullEnd > len(text) {
+		fullStart, fullEnd = valueStart, valueEnd
+	}
+	fullMatch := text[fullStart:fullEnd]
+	var line string
+	lineReady := false
+	getLine := func() string {
+		if !lineReady {
+			line = enclosingLine(text, fullStart, fullEnd)
+			lineReady = true
+		}
+		return line
+	}
+	for i := range s.globalAllow {
+		if s.globalAllow[i].matches(secret, fullMatch, getLine) {
+			return true
+		}
+	}
+	for i := range ruleAllow {
+		if ruleAllow[i].matches(secret, fullMatch, getLine) {
+			return true
+		}
+	}
+	return false
 }
 
 // Detect returns every raw detection in text, unmerged and in detector order.
@@ -181,7 +229,7 @@ func (s *Scanner) Detect(text string) []Span {
 				valueStart, valueEnd = sp.start, sp.end
 			}
 			out[i] = Span{Start: sp.start, End: sp.end, Label: sp.label, Source: sp.source,
-				ValueStart: valueStart, ValueEnd: valueEnd, MinEntropy: sp.minEntropy, Rule: sp.rule}
+				ValueStart: valueStart, ValueEnd: valueEnd, MinEntropy: sp.minEntropy, Rule: sp.rule, RuleIndex: sp.ruleIdx}
 		}
 	})
 	return out
@@ -395,7 +443,7 @@ func (s *Scanner) detectSecrets(text string, sig *signals, patHit []bool, spans 
 				}
 			}
 			spans = append(spans, span{start: start, end: end, label: "[密钥]", source: SourceRule,
-				valueStart: valueStart, valueEnd: valueEnd, minEntropy: rule.Entropy, rule: rule.ID})
+				valueStart: valueStart, valueEnd: valueEnd, minEntropy: rule.Entropy, rule: rule.ID, ruleIdx: i})
 		}
 	}
 

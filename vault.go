@@ -225,7 +225,7 @@ const literalBoundaryMin = 8
 // Without this pass such a value would go upstream in clear text. Short
 // values and structured types (IPs, phones, emails) must sit on word
 // boundaries; matches never overlap skip (sorted, disjoint).
-func (v *vault) literalMatches(text string, skip []interval, dst []literalMatch) []literalMatch {
+func (v *vault) literalMatches(text string, skip []interval, dst []literalMatch, keep func(value, typ string) bool) []literalMatch {
 	if len(text) < 4 {
 		return dst
 	}
@@ -254,6 +254,9 @@ func (v *vault) literalMatches(text string, skip []interval, dst []literalMatch)
 		for _, e := range v.buckets[k] {
 			n := len(e.value)
 			if n > len(text)-i || text[i:i+n] != e.value {
+				continue
+			}
+			if keep != nil && !keep(e.value, e.typ) {
 				continue
 			}
 			end := i + n

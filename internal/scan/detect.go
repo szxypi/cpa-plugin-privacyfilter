@@ -31,6 +31,7 @@ type span struct {
 	valueStart, valueEnd int
 	minEntropy           float64
 	rule                 string
+	ruleIdx              int
 }
 
 var (

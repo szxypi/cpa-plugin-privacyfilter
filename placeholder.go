@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -87,7 +86,7 @@ func newPlaceholderFormat(style, prefix string) (*placeholderFormat, error) {
 		return &placeholderFormat{
 			style:  style,
 			prefix: prefix,
-			re: regexp.MustCompile(regexp.QuoteMeta(prefix) + `-(?:` + strings.Join(knownTypes, "|") +
+			re: regexp.MustCompile(`(?i)` + regexp.QuoteMeta(prefix) + `-(?:` + strings.Join(knownTypes, "|") +
 				`)-[0-9a-f]{` + fmt.Sprint(shortIDHexLen) + `}`),
 			marker: prefix + "-",
 			maxLen: len(prefix) + 1 + longest + 1 + shortIDHexLen,
@@ -95,7 +94,7 @@ func newPlaceholderFormat(style, prefix string) (*placeholderFormat, error) {
 	case styleUUID:
 		return &placeholderFormat{
 			style:  style,
-			re:     regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}`),
+			re:     regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}`),
 			marker: "-8",
 			maxLen: 36,
 		}, nil
@@ -124,13 +123,96 @@ func (f *placeholderFormat) render(key []byte, value, typ string, salt int) stri
 }
 
 // mayContain is a cheap necessary condition for find to return anything.
+// It scans ASCII case-insensitively so placeholders uppercased by a model are
+// still found without allocating on clean text.
 func (f *placeholderFormat) mayContain(s string) bool {
-	return strings.Contains(s, f.marker)
+	return containsFoldASCII(s, f.marker)
 }
 
 // mayContainBytes is mayContain for a byte slice, without copying it.
 func (f *placeholderFormat) mayContainBytes(b []byte) bool {
-	return bytes.Contains(b, []byte(f.marker))
+	return containsFoldBytesASCII(b, f.marker)
+}
+
+func containsFoldASCII(s, lowerSub string) bool {
+	n := len(lowerSub)
+	if n == 0 {
+		return true
+	}
+	if len(s) < n {
+		return false
+	}
+	first := lowerSub[0]
+	limit := len(s) - n
+	for i := 0; i <= limit; i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != first {
+			continue
+		}
+		match := true
+		for j := 1; j < n; j++ {
+			cj := s[i+j]
+			if cj >= 'A' && cj <= 'Z' {
+				cj += 'a' - 'A'
+			}
+			if cj != lowerSub[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func containsFoldBytesASCII(b []byte, lowerSub string) bool {
+	n := len(lowerSub)
+	if n == 0 {
+		return true
+	}
+	if len(b) < n {
+		return false
+	}
+	first := lowerSub[0]
+	limit := len(b) - n
+	for i := 0; i <= limit; i++ {
+		c := b[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != first {
+			continue
+		}
+		match := true
+		for j := 1; j < n; j++ {
+			cj := b[i+j]
+			if cj >= 'A' && cj <= 'Z' {
+				cj += 'a' - 'A'
+			}
+			if cj != lowerSub[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func canonicalPlaceholder(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return strings.ToLower(s)
+		}
+	}
+	return s
 }
 
 // find returns the [start, end) offsets of every placeholder-shaped substring.

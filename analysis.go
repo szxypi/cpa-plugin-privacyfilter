@@ -35,9 +35,11 @@ func (a *textAnalysis) size() int {
 
 // analyzer runs the detectors and the plugin-level filters.
 type analyzer struct {
-	scanner   *scan.Scanner
-	format    *placeholderFormat
-	skipTypes map[string]bool
+	scanner        *scan.Scanner
+	format         *placeholderFormat
+	skipTypes      map[string]bool
+	allowRegexes   []*regexp.Regexp
+	allowStopwords *scan.KeywordMatcher
 }
 
 func findIntervals(format *placeholderFormat, text string) []interval {
@@ -48,14 +50,28 @@ func findIntervals(format *placeholderFormat, text string) []interval {
 	return out
 }
 
+func (az *analyzer) isUserAllowlisted(value string) bool {
+	if az.allowStopwords != nil && az.allowStopwords.ContainsAny(value) {
+		return true
+	}
+	for _, re := range az.allowRegexes {
+		if re.MatchString(value) {
+			return true
+		}
+	}
+	return false
+}
+
 func (az *analyzer) analyze(text string) textAnalysis {
 	out := textAnalysis{placeholders: findIntervals(az.format, text)}
 	raw := az.scanner.Detect(text)
-	if len(raw) == 0 {
+	extra := detectExtra(text, az.skipTypes)
+	if len(raw) == 0 && len(extra) == 0 {
 		return out
 	}
-	kept := raw[:0]
+	kept := make([]scan.Span, 0, len(raw)+len(extra))
 	for _, sp := range raw {
+		orig := sp
 		var ok bool
 		if sp.Start, sp.End, ok = narrowValue(text, sp); !ok {
 			continue
@@ -64,10 +80,45 @@ func (az *analyzer) analyze(text string) textAnalysis {
 		if az.skipTypes[typ] {
 			continue
 		}
-		if typ == typeIP && isBenignIP(text, sp.Start, sp.End) {
+		if orig.Source != scan.SourcePII && az.scanner.Allowlisted(text, orig, sp.Start, sp.End) {
 			continue
 		}
-		if typ == typeCard && !plausibleCard(text, sp.Start, sp.End) {
+		if az.isUserAllowlisted(text[sp.Start:sp.End]) {
+			continue
+		}
+		switch typ {
+		case typeIP:
+			if isBenignIP(text, sp.Start, sp.End) {
+				continue
+			}
+		case typeCard:
+			if !plausibleCard(text, sp.Start, sp.End) {
+				continue
+			}
+		case typeIDCard:
+			if !plausibleIDCard(text, sp.Start, sp.End) {
+				continue
+			}
+		case typePhone:
+			if !plausiblePhone(text, sp.Start, sp.End) {
+				continue
+			}
+		case typeEmail:
+			if isBenignEmail(text, sp.Start, sp.End) {
+				continue
+			}
+		}
+		if overlapsAny(sp.Start, sp.End, out.placeholders) {
+			continue
+		}
+		kept = append(kept, sp)
+	}
+	for _, sp := range extra {
+		typ := typeForLabel(sp.Label)
+		if az.skipTypes[typ] {
+			continue
+		}
+		if az.isUserAllowlisted(text[sp.Start:sp.End]) {
 			continue
 		}
 		if overlapsAny(sp.Start, sp.End, out.placeholders) {
@@ -93,7 +144,10 @@ func overlapsAny(start, end int, sorted []interval) bool {
 	return false
 }
 
-var reAssignName = regexp.MustCompile(`^-{0,2}[A-Za-z_][A-Za-z0-9_.-]*$`)
+var (
+	reAssignName    = regexp.MustCompile(`^-{0,2}[A-Za-z_][A-Za-z0-9_.-]*$`)
+	reTrailingParam = regexp.MustCompile(`[&;][A-Za-z_][A-Za-z0-9_.-]*=`)
+)
 
 // narrowValue shrinks a detection to the value a placeholder should stand for.
 // Upstream matches often include the key name ("GITHUB_TOKEN=ghp_...",
@@ -112,14 +166,19 @@ func narrowValue(text string, sp scan.Span) (start, end int, ok bool) {
 			if sp.MinEntropy > 0 && scan.Entropy(value) < sp.MinEntropy {
 				return start, end, false
 			}
-			if sp.Rule == "generic-api-key" && looksLikeCode(value) {
+			if sp.Rule == "generic-api-key" && looksLikeIdentifier(value) {
 				return start, end, false
 			}
 			return start, end, true
 		}
 		return narrowAssignment(text, start, end, false)
 	case scan.SourceEntropy:
-		return narrowAssignment(text, start, end, true)
+		var narrowed bool
+		start, end, narrowed = narrowAssignment(text, start, end, true)
+		if !narrowed || looksLikeIdentifier(text[start:end]) {
+			return start, end, false
+		}
+		return start, end, true
 	}
 	return start, end, true
 }
@@ -142,103 +201,18 @@ func narrowAssignment(text string, start, end int, recheck bool) (int, int, bool
 	return start + eq + 1, end, true
 }
 
-// trimContextValue drops closing punctuation the sentence detector swallows
-// ("token: abc123)," -> "abc123").
+// trimContextValue drops trailing query/connection parameters
+// ("password=secret&sslmode=require" -> "secret") and closing punctuation the
+// sentence detector swallows ("token: abc123)," -> "abc123").
 func trimContextValue(text string, start, end int) int {
-	for end > start && strings.IndexByte(",)]}>", text[end-1]) >= 0 {
+	if loc := reTrailingParam.FindStringIndex(text[start:end]); loc != nil && loc[0] > 0 {
+		end = start + loc[0]
+	}
+	for end > start && strings.IndexByte(",)]}>`", text[end-1]) >= 0 {
 		end--
 	}
 	return end
 }
-
-var (
-	reDottedIdent = regexp.MustCompile(`^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$`)
-	codeKeywords  = map[string]bool{
-		"null": true, "none": true, "nil": true, "true": true, "false": true,
-		"undefined": true, "string": true, "bytes": true, "number": true,
-		"integer": true, "boolean": true, "object": true, "optional": true,
-		"required": true, "secret": true, "password": true, "token": true,
-		"redacted": true, "hidden": true, "masked": true, "changeme": true,
-	}
-)
-
-// looksLikeCode rejects values of the "password: value" detector that are
-// really source code: calls, indexing, templates, member chains and type
-// names. Left in, a single `password = os.getenv(` would otherwise become a
-// vault entry and every later `os.getenv(` in the conversation a placeholder.
-func looksLikeCode(value string) bool {
-	if strings.ContainsAny(value, "()[]{}<>$`\\") {
-		return true
-	}
-	if reDottedIdent.MatchString(value) {
-		return true
-	}
-	return codeKeywords[strings.ToLower(value)]
-}
-
-// isBenignIP skips dotted quads that identify no host: loopback, the
-// unspecified address, netmasks, and version strings that only look like an
-// address (a kernel release with a "-microsoft" suffix, a "==" pin, a "v" prefix).
-func isBenignIP(text string, start, end int) bool {
-	ip := text[start:end]
-	if strings.HasPrefix(ip, "127.") || strings.HasPrefix(ip, "0.") || strings.HasPrefix(ip, "255.") {
-		return true
-	}
-	if start > 0 && isASCIILetter(text[start-1]) {
-		return true
-	}
-	if start >= 2 {
-		switch text[start-2 : start] {
-		case "==", ">=", "<=", "~=", "!=":
-			return true
-		}
-	}
-	// A letter after the dash ("-microsoft", "_rc1") marks a release tag. A
-	// digit after the dash (a range such as "a-b") stays an address.
-	if end+1 < len(text) && (text[end] == '-' || text[end] == '_') && isASCIILetter(text[end+1]) {
-		return true
-	}
-	return false
-}
-
-func isASCIILetter(c byte) bool { return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
-
-// plausibleCard keeps a Luhn-valid digit run only when it could be a payment
-// card. Luhn alone passes about one random number in ten, so timestamps,
-// decimal fractions and hex identifiers all matched. The scan package stays
-// identical to upstream; this filter runs on top of it.
-func plausibleCard(text string, start, end int) bool {
-	digits := text[start:end]
-	// Issuer ranges: 3 (Amex, JCB, Diners), 4 (Visa), 5 and 2221-2720
-	// (Mastercard), 6 (UnionPay, Discover, Maestro), 81 (UnionPay).
-	switch digits[0] {
-	case '3', '4', '5', '6':
-	case '2':
-		if len(digits) < 4 || digits[:4] < "2221" || digits[:4] > "2720" {
-			return false
-		}
-	case '8':
-		if digits[1] != '1' {
-			return false
-		}
-	default:
-		return false
-	}
-	// "costUSD":0.0912... is a fraction, not a card number.
-	if start >= 2 && text[start-1] == '.' && isDigit(text[start-2]) {
-		return false
-	}
-	// Hex identifiers and slugs glue the digits to letters.
-	if start > 0 && (isASCIILetter(text[start-1]) || text[start-1] == '_') {
-		return false
-	}
-	if end < len(text) && (isASCIILetter(text[end]) || text[end] == '_') {
-		return false
-	}
-	return true
-}
-
-func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 
 // analysisCache memoises analyses by content hash. Coding agents replay the
 // whole conversation every turn, so in steady state only new text is scanned.

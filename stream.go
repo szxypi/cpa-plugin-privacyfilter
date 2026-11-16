@@ -272,6 +272,12 @@ func (st *requestState) restoreWhole(js []byte) []byte {
 	return out
 }
 
+func (st *requestState) restoreAfterDelta(js []byte) []byte {
+	out, n := st.r.restoreJSONAfterDelta(js)
+	st.restored += n
+	return out
+}
+
 // flush emits synthetic delta events for the held tails of the SSE-framed
 // channels selected by keep, and forgets those channels.
 func (st *requestState) flush(canSynth bool, selected func(key string, ch *channelState) bool) []synthEvent {
@@ -488,7 +494,7 @@ func (st *requestState) openaiChunk(js []byte) []byte {
 			}
 		}
 	}
-	if rewritten := st.restoreWhole(out); rewritten != nil {
+	if rewritten := st.restoreAfterDelta(out); rewritten != nil {
 		out, changed = rewritten, true
 	}
 	if !changed {
@@ -556,7 +562,7 @@ func (st *requestState) geminiChunk(js []byte) []byte {
 			st.dropChannel(key)
 		}
 	}
-	if rewritten := st.restoreWhole(out); rewritten != nil {
+	if rewritten := st.restoreAfterDelta(out); rewritten != nil {
 		out, changed = rewritten, true
 	}
 	if !changed {

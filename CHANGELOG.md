@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+
+- Microsoft Security Utilities identifiable secret detectors (`microsoft/security-utilities`
+  `PreciselyClassifiedSecurityKeys` and `UnclassifiedPotentialSecurityKeys`): 84/88-char CASK keys (`JQQJ99`/`9D`/`9H`
+  used by Azure OpenAI, Cognitive Services, modern Azure DevOps PATs and Azure SQL), Entra ID client secrets (`7Q~`/`8Q~`),
+  Azure Functions (`AzFu`), Azure AI Search (`AzSe`), Azure Container Registry (`+ACR`), Azure Storage / CosmosDB / Batch /
+  ML / APIM (`+ASt`/`ACDb`/`+ABa`/`+AMC`/`APIM`), Azure Relay / EventHub / ServiceBus / IoT / Redis / EventGrid
+  (`+ARm`/`+AEh`/`+ASb`/`AIoT`/`AzCa`/`AZEG`), NuGet (`oy2`), connection-string keys (`AccountKey=`/`StorageKey=`/
+  `SharedAccessKey=`), and SAS signatures (`sig=`/`dsas_secret=`). All extra patterns are gated by a single Aho-Corasick
+  keyword pass.
+- Modern AI gateway key detectors (`sk-or-v1-`, hex and mixed-case `sk-`, `xai-`, `gsk_`), with CSS class and placeholder
+  filtering.
+- URI userinfo credential detection (`scheme://[user]:<password>@host` across HTTP, FTP, PostgreSQL, MySQL, MariaDB,
+  MongoDB, Redis, AMQP, NATS, ClickHouse, SQL Server, SOCKS5 and SSH), database/cache CLI password flags (`mysql`/`mysqldump`/
+  `mariadb -p<password>`, `--password`, `redis-cli -a`), connection-string `Password=`/`Pwd=` parameters, and full
+  multiline PEM / OpenSSH / PGP private key blocks (including encrypted blocks with commas in headers).
+- Allocated unicast IPv6 host address detection (`2000::/3` excluding RFC 3849 `2001:db8::/32` documentation, `fc00::/7`
+  ULA, and `fe80::/10` link-local), validated with `net/netip`.
+- Gitleaks global `[allowlist]` and per-rule `[[rules.allowlists]]` evaluation (`regexes`, `regexTarget`, `condition`, and
+  Aho-Corasick `stopwords`), plus `allowlist_regexes` and `allowlist_stopwords` configuration fields.
+
+### Fixed
+
+- Code symbols (`snake_case`, `SCREAMING_SNAKE_CASE`, multi-hump `camelCase`/`PascalCase`, file paths, CLI flags) and
+  non-secret key names (`primary_key`, `key_name`, `csrf_token`, etc.) are no longer replaced as keys or added to the vault.
+- Presidio-style structural and checksum validation for PII: PRC resident ID cards now require a valid GB/T 2260 province
+  code, a valid calendar birth date, and a valid GB 11643-1999 (ISO 7064 MOD 11-2) check digit; Chinese mobile numbers
+  require an allocated MIIT carrier prefix and clean token boundaries; email detection skips URI credentials, scoped
+  packages, retina asset filenames (`@2x.png`) and systemd template units (`@.service`); IPv4 detection skips leading-zero
+  octets, `169.254.169.254`, `+build` suffixes, and `"version": "a.b.c.d"` labels without a port or CIDR suffix.
+- Placeholders uppercased by models (`PF-KEY-...`) are matched and restored case-insensitively across non-streaming and
+  streaming responses.
+- OpenAI chat and Gemini stream handlers no longer walk `delta.content`, `delta.tool_calls`, or `parts[].text` twice,
+  preventing duplicate `unknown` placeholder counts.
+
+## 0.4.2
+
+### Added
+
+- `skip_model_prefixes`: skip redaction and restoration for models whose routed or requested name starts with any listed
+  prefix (case-insensitive).
+
 ## 0.4.1
 
 ### Fixed

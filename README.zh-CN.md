@@ -216,8 +216,11 @@ plugins:
 | `literal_min_bytes` | integer | `6` | 已识别值在其他上下文再次出现时也替换的最小长度（最小 4，按词边界匹配）。 |
 | `gitleaks_toml`   | string  | `""`       | 自定义 gitleaks 规则文件路径，相对路径基于插件目录解析。                |
 | `skip_models`     | array   | `[]`       | 跳过脱敏的模型（同时匹配路由后模型与客户端请求的模型）。            |
+| `skip_model_prefixes` | array | `[]`     | 跳过脱敏的模型名前缀（大小写不敏感，同时比对路由后模型与客户端请求模型）。 |
 | `skip_formats`    | array   | `[]`       | 跳过脱敏的来源格式。                                             |
 | `disable_rules`   | array   | `[]`       | 按 id 关闭 gitleaks 规则。`generic-api-key` 约占 60% 耗时且误报最多。 |
+| `allowlist_regexes` | array | `[]`       | 自定义白名单正则表达式（RE2），命中的候选值保留明文。 |
+| `allowlist_stopwords` | array | `[]`     | 自定义白名单停用词（大小写不敏感子串），包含任一词的候选值保留明文。 |
 | `max_body_bytes`  | integer | `33554432` | 超过该字节数的请求体不扫描。`-1` 表示不限制。                        |
 | `scan_tool_input` | boolean | `true`     | 是否扫描工具调用参数与工具结果。                                    |
 | `cache_entries`   | integer | `4096`     | 跨请求记住的文本条数，`0` 关闭缓存。                                |

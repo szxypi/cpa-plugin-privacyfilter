@@ -15,17 +15,22 @@ type Rule struct {
 	Keywords    []string // lower-cased; empty means the rule always runs
 	Entropy     float64
 	SecretGroup int
+
+	allowlists       []allowlist
+	globalAllowlists []allowlist
 }
 
-// tomlConfig is the subset of gitleaks.toml this scanner understands. Unknown
-// fields (allowlists, descriptions, ...) are ignored.
+// tomlConfig is the subset of gitleaks.toml this scanner understands.
 type tomlConfig struct {
-	Rules []struct {
-		ID          string   `toml:"id"`
-		Regex       string   `toml:"regex"`
-		Keywords    []string `toml:"keywords"`
-		Entropy     float64  `toml:"entropy"`
-		SecretGroup int      `toml:"secretGroup"`
+	Allowlist  tomlAllowlist   `toml:"allowlist"`
+	Allowlists []tomlAllowlist `toml:"allowlists"`
+	Rules      []struct {
+		ID          string          `toml:"id"`
+		Regex       string          `toml:"regex"`
+		Keywords    []string        `toml:"keywords"`
+		Entropy     float64         `toml:"entropy"`
+		SecretGroup int             `toml:"secretGroup"`
+		Allowlists  []tomlAllowlist `toml:"allowlists"`
 	} `toml:"rules"`
 }
 
@@ -55,6 +60,8 @@ func LoadRules(document []byte, disabled []string) (rules []Rule, skipped int, e
 	if _, errDecode := toml.Decode(string(document), &cfg); errDecode != nil {
 		return nil, 0, fmt.Errorf("parse gitleaks rules: %w", errDecode)
 	}
+	globalRaw := append([]tomlAllowlist{cfg.Allowlist}, cfg.Allowlists...)
+	globalAllow := compileAllowlists(globalRaw)
 	drop := disabledSet(disabled)
 	for _, raw := range cfg.Rules {
 		if raw.Regex == "" {
@@ -75,12 +82,18 @@ func LoadRules(document []byte, disabled []string) (rules []Rule, skipped int, e
 			}
 			keywords = append(keywords, strings.ToLower(keyword))
 		}
+		var ruleAllow []allowlist
+		if !strings.EqualFold(raw.ID, "aws-access-token") {
+			ruleAllow = compileAllowlists(raw.Allowlists)
+		}
 		rules = append(rules, Rule{
-			ID:          raw.ID,
-			Re:          re,
-			Keywords:    keywords,
-			Entropy:     raw.Entropy,
-			SecretGroup: raw.SecretGroup,
+			ID:               raw.ID,
+			Re:               re,
+			Keywords:         keywords,
+			Entropy:          raw.Entropy,
+			SecretGroup:      raw.SecretGroup,
+			allowlists:       ruleAllow,
+			globalAllowlists: globalAllow,
 		})
 	}
 	if len(rules) == 0 {

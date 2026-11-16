@@ -63,7 +63,7 @@ func (r *restorer) replace(s string, mode escMode) (string, int) {
 	var b strings.Builder
 	prev, count := 0, 0
 	for _, loc := range locs {
-		value, ok := r.values[s[loc[0]:loc[1]]]
+		value, ok := r.values[canonicalPlaceholder(s[loc[0]:loc[1]])]
 		if !ok {
 			r.unknown++
 			continue
@@ -100,9 +100,24 @@ func (r *restorer) delta(pending, fragment string, mode escMode, final bool) (em
 			lastEnd = locs[len(locs)-1][1]
 		}
 		limit := min(len(s)-lastEnd, r.format.maxLen-1)
+		var foldBuf [64]byte
 		for n := limit; n > 0; n-- {
-			if _, ok := r.prefixes[s[len(s)-n:]]; ok {
-				tail = s[len(s)-n:]
+			suf := s[len(s)-n:]
+			key := suf
+			if n <= len(foldBuf) {
+				for i := 0; i < n; i++ {
+					c := suf[i]
+					if c >= 'A' && c <= 'Z' {
+						c += 'a' - 'A'
+					}
+					foldBuf[i] = c
+				}
+				key = string(foldBuf[:n])
+			} else {
+				key = canonicalPlaceholder(suf)
+			}
+			if _, ok := r.prefixes[key]; ok {
+				tail = suf
 				s = s[:len(s)-n]
 				break
 			}
@@ -131,11 +146,21 @@ var (
 // restoreJSON restores placeholders in every model-output string of a JSON
 // document and returns the rewritten document, or nil when nothing changed.
 func (r *restorer) restoreJSON(body []byte) ([]byte, int) {
+	return r.restoreJSONWithOpts(body, false)
+}
+
+// restoreJSONAfterDelta restores non-delta fields of an OpenAI or Gemini stream
+// chunk after applyDelta has already processed the primary streamed fields.
+func (r *restorer) restoreJSONAfterDelta(body []byte) ([]byte, int) {
+	return r.restoreJSONWithOpts(body, true)
+}
+
+func (r *restorer) restoreJSONWithOpts(body []byte, skipStreamDeltas bool) ([]byte, int) {
 	if r == nil || !r.format.mayContainBytes(body) || !gjson.ValidBytes(body) {
 		return nil, 0
 	}
 	w := restoreWalker{r: r}
-	w.walk(gjson.ParseBytes(body), "", 0)
+	w.walk(gjson.ParseBytes(body), "", "", 0, skipStreamDeltas)
 	if len(w.edits) == 0 {
 		return nil, 0
 	}
@@ -148,13 +173,24 @@ type restoreWalker struct {
 	count int
 }
 
-func (w *restoreWalker) walk(v gjson.Result, key string, depth int) {
+func isStreamEnvelopeContainer(key string) bool {
+	switch key {
+	case "response", "choices", "delta", "candidates", "content", "parts":
+		return true
+	}
+	return false
+}
+
+func (w *restoreWalker) walk(v gjson.Result, key, parentKey string, depth int, inEnvelope bool) {
 	if depth > 64 {
 		return
 	}
 	switch {
 	case v.Type == gjson.String:
 		if v.Index <= 0 || !w.r.format.mayContain(v.Raw) {
+			return
+		}
+		if inEnvelope && ((parentKey == "delta" && key == "content") || (parentKey == "parts" && key == "text")) {
 			return
 		}
 		mode := modeRaw
@@ -180,8 +216,11 @@ func (w *restoreWalker) walk(v gjson.Result, key string, depth int) {
 		}
 		v.ForEach(func(k, item gjson.Result) bool {
 			name := k.String()
+			if inEnvelope && key == "delta" && name == "tool_calls" {
+				return true
+			}
 			if !restoreSkipKeys[name] {
-				w.walk(item, name, depth+1)
+				w.walk(item, name, key, depth+1, inEnvelope && isStreamEnvelopeContainer(name))
 			}
 			return true
 		})
@@ -190,7 +229,7 @@ func (w *restoreWalker) walk(v gjson.Result, key string, depth int) {
 			return
 		}
 		v.ForEach(func(_, item gjson.Result) bool {
-			w.walk(item, key, depth+1)
+			w.walk(item, key, parentKey, depth+1, inEnvelope)
 			return true
 		})
 	}

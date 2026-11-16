@@ -246,7 +246,7 @@ func (p *privacyFilterPlugin) existingPlaceholders(body []byte) map[string]strin
 	}
 	var values map[string]string
 	for _, loc := range p.format.re.FindAllIndex(body, -1) {
-		placeholder := string(body[loc[0]:loc[1]])
+		placeholder := canonicalPlaceholder(string(body[loc[0]:loc[1]]))
 		if value, ok := p.vault.lookup(placeholder); ok {
 			if values == nil {
 				values = make(map[string]string, 4)
@@ -277,7 +277,9 @@ func (p *privacyFilterPlugin) rewriteField(text string, analysis textAnalysis, j
 		skip = analysis.placeholders
 	}
 	before := len(reps)
-	reps = p.vault.literalMatches(text, skip, reps)
+	reps = p.vault.literalMatches(text, skip, reps, func(val, typ string) bool {
+		return !p.analyzer.skipTypes[typ] && !p.analyzer.isUserAllowlisted(val)
+	})
 	result.literals = len(reps) - before
 	if len(reps) == 0 {
 		return result

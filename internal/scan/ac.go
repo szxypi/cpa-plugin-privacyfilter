@@ -115,3 +115,69 @@ func (m *matcher) scan(text string, hit []bool) {
 		}
 	}
 }
+
+// containsAny reports whether any compiled pattern occurs in text.
+func (m *matcher) containsAny(text string) bool {
+	if m == nil {
+		return false
+	}
+	state := int32(0)
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		state = m.next[int(state)<<8|int(c)]
+		if len(m.emit[state]) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// KeywordMatcher is an exported ASCII-case-insensitive Aho-Corasick automaton
+// for multi-pattern substring prefiltering and stopword matching.
+type KeywordMatcher struct {
+	m        *matcher
+	patterns int
+}
+
+// NewKeywordMatcher compiles non-empty patterns into a dense DFA. It returns
+// nil when patterns contains no non-empty string.
+func NewKeywordMatcher(patterns []string) *KeywordMatcher {
+	hasNonEmpty := false
+	for _, p := range patterns {
+		if p != "" {
+			hasNonEmpty = true
+			break
+		}
+	}
+	if !hasNonEmpty {
+		return nil
+	}
+	return &KeywordMatcher{m: newMatcher(patterns), patterns: len(patterns)}
+}
+
+// PatternCount returns the number of pattern slots in the matcher.
+func (km *KeywordMatcher) PatternCount() int {
+	if km == nil {
+		return 0
+	}
+	return km.patterns
+}
+
+// ContainsAny reports whether any compiled pattern appears in text.
+func (km *KeywordMatcher) ContainsAny(text string) bool {
+	if km == nil {
+		return false
+	}
+	return km.m.containsAny(text)
+}
+
+// Scan marks hit[id] for every pattern id that appears in text.
+func (km *KeywordMatcher) Scan(text string, hit []bool) {
+	if km == nil {
+		return
+	}
+	km.m.scan(text, hit)
+}

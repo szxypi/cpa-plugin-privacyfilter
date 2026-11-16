@@ -216,10 +216,21 @@ Plugin fields:
 
 | Field             | Type    | Default    | Description                                                                                   |
 |-------------------|---------|------------|-----------------------------------------------------------------------------------------------|
+| `placeholder_style` | string | `short`   | `short` (`pf-key-3a7f9c21d0b4`) or `uuid` (v8 UUID).                          |
+| `placeholder_prefix` | string | `pf`     | Prefix for `short` placeholders (1-16 lowercase letters or digits).           |
+| `restore_responses` | boolean | `true`   | Restore placeholders in non-streaming and streaming responses.                |
+| `notice`          | boolean | `true`     | Append a system-prompt notice when a request carries placeholders.            |
+| `skip_types`      | array   | `[]`       | Placeholder types to leave in clear text (`key`/`email`/`phone`/`idcard`/`ip`/`card`). |
+| `data_dir`        | string  | `privacyfilter` | Directory holding `placeholder.key`, relative to CPA's working directory. |
+| `vault_max_entries` | integer | `100000` | Maximum entries retained in the in-memory vault.                              |
+| `literal_min_bytes` | integer | `6`      | Minimum length of a known value re-replaced in later contexts (minimum 4).    |
 | `gitleaks_toml`   | string  | `""`       | Custom gitleaks rule file path. Relative paths are resolved from the plugin directory.        |
 | `skip_models`     | array   | `[]`       | Models that should skip redaction (matched against both the routed and the requested model).  |
+| `skip_model_prefixes` | array | `[]`     | Case-insensitive model prefixes that skip redaction and restoration.          |
 | `skip_formats`    | array   | `[]`       | Source formats that should skip redaction.                                                    |
 | `disable_rules`   | array   | `[]`       | Gitleaks rule ids to drop. `generic-api-key` is ~60% of scan time and most false positives.   |
+| `allowlist_regexes` | array | `[]`       | RE2 regular expressions whose matching candidate values stay in clear text.   |
+| `allowlist_stopwords` | array | `[]`     | Case-insensitive substrings whose matching candidate values stay in clear text. |
 | `max_body_bytes`  | integer | `33554432` | Skip bodies larger than this. `-1` means no limit.                                            |
 | `scan_tool_input` | boolean | `true`     | Include tool-call arguments and tool results.                                                 |
 | `cache_entries`   | integer | `4096`     | Texts remembered between requests. `0` disables the cache.                                    |
