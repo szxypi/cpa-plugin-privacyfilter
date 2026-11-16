@@ -172,7 +172,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y clang lld wget
+          sudo apt-get install -y clang lld xz-utils
 
       - name: Resolve release metadata
         id: release_metadata
@@ -180,17 +180,24 @@ jobs:
 
       - name: Build FreeBSD shared library
         timeout-minutes: 45
-        uses: go-cross/cgo-actions@v1
-        env:
-          GOFLAGS: -trimpath -buildmode=c-shared
-        with:
-          dir: .
-          packages: .
-          targets: freebsd-${{ matrix.goarch }}
-          out-dir: dist/freebsd-${{ matrix.goarch }}
-          output: ${{ env.PLUGIN_ID }}.so
-          flags: -ldflags=-s -w
-          x-flags: main.pluginVersion=${{ steps.release_metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          SYSROOT="${RUNNER_TEMP}/freebsd-sysroot"
+          mkdir -p "${SYSROOT}"
+          FREEBSD_REL="$(curl -fsSL https://download.freebsd.org/releases/amd64/ | grep -oE '14\.[0-9]+-RELEASE' | sort -V | tail -n1 || true)"
+          FREEBSD_REL="${FREEBSD_REL:-14.5-RELEASE}"
+          curl -fsSL "https://download.freebsd.org/releases/amd64/${FREEBSD_REL}/base.txz" -o "${RUNNER_TEMP}/base.txz" \
+            || curl -fsSL "https://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/amd64/${FREEBSD_REL}/base.txz" -o "${RUNNER_TEMP}/base.txz"
+          sudo tar -xf "${RUNNER_TEMP}/base.txz" -C "${SYSROOT}" ./lib ./usr/lib ./usr/include
+          rm -f "${RUNNER_TEMP}/base.txz"
+          mkdir -p "dist/freebsd-${{ matrix.goarch }}"
+          CGO_ENABLED=1 GOOS=freebsd GOARCH=${{ matrix.goarch }} \
+            CC="clang --target=x86_64-unknown-freebsd${FREEBSD_REL%%-*} --sysroot=${SYSROOT}" \
+            CGO_LDFLAGS="-fuse-ld=lld" \
+            go build -trimpath -buildmode=c-shared \
+              -ldflags "-s -w -X main.pluginVersion=${{ steps.release_metadata.outputs.version }}" \
+              -o "dist/freebsd-${{ matrix.goarch }}/${PLUGIN_ID}.so" .
+          rm -f "dist/freebsd-${{ matrix.goarch }}/${PLUGIN_ID}.h"
 
       - name: Package plugin
         run: scripts/package-plugin.sh dist/freebsd-${{ matrix.goarch }} "${PLUGIN_ID}.so" "${ARCHIVE_NAME}"
